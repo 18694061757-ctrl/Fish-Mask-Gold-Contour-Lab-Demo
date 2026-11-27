@@ -1,6 +1,7 @@
 package com.yujian.fishmasklab.runtime
 
 import android.content.res.AssetManager
+import android.os.SystemClock
 import java.security.MessageDigest
 
 enum class ModelRuntimeStatus {
@@ -8,6 +9,13 @@ enum class ModelRuntimeStatus {
   WARMING_UP,
   READY,
   NOT_READY,
+  ERROR,
+}
+
+enum class ModelLoadLifecycleState {
+  NOT_STARTED,
+  LOADING,
+  READY,
   ERROR,
 }
 
@@ -40,6 +48,7 @@ data class ModelAssetEntry(
   val sizeBytes: Long,
   val sha256: String?,
   val expectedSha256: String? = null,
+  val sha256DurationMs: Double = 0.0,
 ) {
   val shaVerified: Boolean
     get() = present && (expectedSha256 == null || sha256.equals(expectedSha256, ignoreCase = true))
@@ -56,6 +65,10 @@ data class ModelAssetAuditReport(
   val slimSamManifestAsset: ModelAssetEntry,
   val missingAssets: List<String>,
   val shaMismatchedAssets: List<String>,
+  val auditStartMonoNs: Long = 0L,
+  val auditEndMonoNs: Long = 0L,
+  val auditDurationMs: Double = 0.0,
+  val sha256TotalDurationMs: Double = 0.0,
 ) {
   val isYoloxReady: Boolean get() = yoloxAsset.present && yoloxAsset.shaVerified
   val isSlimSamReady: Boolean
@@ -101,6 +114,7 @@ object ModelAssetAudit {
   const val SLIMSAM_MANIFEST_PATH = "models/slimsam/slimsam_model_manifest.json"
 
   fun runAudit(assets: AssetManager): ModelAssetAuditReport {
+    val auditStartNs = SystemClock.elapsedRealtimeNanos()
     val yolox = inspectAsset(
       assets = assets,
       logicalName = "YOLOX-Nano Fish Detector",
@@ -147,7 +161,18 @@ object ModelAssetAudit {
       logicalName = "SlimSAM-77 Model Manifest",
       assetPath = SLIMSAM_MANIFEST_PATH,
     )
+    val auditEndNs = SystemClock.elapsedRealtimeNanos().coerceAtLeast(auditStartNs)
 
+    val allEntries = listOf(
+      yolox,
+      contract,
+      samEncoder,
+      samDecoder,
+      samProc,
+      samConfig,
+      samQuantize,
+      samManifest,
+    )
     val allRequired = listOf(
       yolox,
       samEncoder,
@@ -171,6 +196,10 @@ object ModelAssetAudit {
       slimSamManifestAsset = samManifest,
       missingAssets = missing,
       shaMismatchedAssets = mismatched,
+      auditStartMonoNs = auditStartNs,
+      auditEndMonoNs = auditEndNs,
+      auditDurationMs = (auditEndNs - auditStartNs).coerceAtLeast(0L) / 1_000_000.0,
+      sha256TotalDurationMs = allEntries.sumOf { it.sha256DurationMs },
     )
   }
 
@@ -180,6 +209,7 @@ object ModelAssetAudit {
     assetPath: String,
     expectedSha256: String? = null,
   ): ModelAssetEntry {
+    val startNs = SystemClock.elapsedRealtimeNanos()
     return try {
       assets.open(assetPath).use { stream ->
         val digest = MessageDigest.getInstance("SHA-256")
@@ -192,6 +222,7 @@ object ModelAssetAudit {
           totalBytes += read
         }
         val sha = digest.digest().joinToString("") { "%02x".format(it) }
+        val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs).coerceAtLeast(0L) / 1_000_000.0
         ModelAssetEntry(
           logicalName = logicalName,
           assetPath = assetPath,
@@ -199,9 +230,11 @@ object ModelAssetAudit {
           sizeBytes = totalBytes,
           sha256 = sha,
           expectedSha256 = expectedSha256,
+          sha256DurationMs = elapsedMs,
         )
       }
     } catch (_: Exception) {
+      val elapsedMs = (SystemClock.elapsedRealtimeNanos() - startNs).coerceAtLeast(0L) / 1_000_000.0
       ModelAssetEntry(
         logicalName = logicalName,
         assetPath = assetPath,
@@ -209,6 +242,7 @@ object ModelAssetAudit {
         sizeBytes = 0L,
         sha256 = null,
         expectedSha256 = expectedSha256,
+        sha256DurationMs = elapsedMs,
       )
     }
   }

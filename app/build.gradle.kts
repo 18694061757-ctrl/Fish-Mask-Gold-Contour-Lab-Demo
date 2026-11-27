@@ -20,6 +20,19 @@ android {
     versionCode = 1
     versionName = "1.0"
 
+    val gitBuildSha = providers.gradleProperty("gitSha")
+      .orElse(providers.environmentVariable("GITHUB_SHA"))
+      .orElse(
+        providers.exec {
+          commandLine("git", "rev-parse", "--short=12", "HEAD")
+          isIgnoreExitValue = true
+        }.standardOutput.asText.map { it.trim() }.orElse("")
+      )
+      .map { raw -> raw.trim().take(12).ifEmpty { "local-build" } }
+      .get()
+    buildConfigField("String", "GIT_BUILD_SHA", "\"$gitBuildSha\"")
+    buildConfigField("String", "ORT_VERSION", "\"${libs.versions.onnxruntimeAndroid.get()}\"")
+
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
