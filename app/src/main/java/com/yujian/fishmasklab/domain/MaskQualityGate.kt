@@ -246,7 +246,7 @@ object MaskQualityGate {
     contour: ContourData?,
     detection: FishDetection?,
   ): Boolean {
-    if (candidate == null || contour == null || contour.rawPointCount < 20) {
+    if (candidate == null || contour == null || !contour.traceClosed || contour.rawPointCount < 20) {
       return false
     }
     return evaluateCandidateGeometryTrustworthiness(candidate, detection)

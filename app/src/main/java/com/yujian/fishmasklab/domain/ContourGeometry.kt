@@ -13,6 +13,13 @@ data class ConnectedComponentResult(
   val startY: Int,
 )
 
+data class BoundaryTraceResult(
+  val points: List<ContourPoint>,
+  val traceClosed: Boolean,
+  val terminationReason: BoundaryTerminationReason,
+  val steps: Int,
+)
+
 /**
  * Pure Kotlin geometry algorithms ported directly from `src/utils/contourExtraction.ts`.
  */
@@ -134,13 +141,23 @@ object ContourGeometry {
   /**
    * Moore-Neighbor Tracing algorithm to trace the exterior perimeter of the primary mask component.
    */
-  fun extractBoundaryPoints(
+  fun extractBoundaryTrace(
     mask: ByteArray,
     width: Int,
     height: Int,
     startHintX: Int = -1,
     startHintY: Int = -1,
-  ): List<ContourPoint> {
+    maxStepsOverride: Int? = null,
+  ): BoundaryTraceResult {
+    if (width <= 0 || height <= 0 || mask.size < width * height) {
+      return BoundaryTraceResult(
+        points = emptyList(),
+        traceClosed = false,
+        terminationReason = BoundaryTerminationReason.INVALID_INPUT,
+        steps = 0,
+      )
+    }
+
     var startX = startHintX
     var startY = startHintY
 
@@ -165,18 +182,42 @@ object ContourGeometry {
       }
     }
 
-    if (startX == -1) return emptyList()
+    if (startX == -1) {
+      return BoundaryTraceResult(
+        points = emptyList(),
+        traceClosed = false,
+        terminationReason = BoundaryTerminationReason.INVALID_INPUT,
+        steps = 0,
+      )
+    }
 
     val dx = intArrayOf(0, 1, 1, 1, 0, -1, -1, -1)
     val dy = intArrayOf(-1, -1, 0, 1, 1, 1, 0, -1)
 
+    var backtrackDir = 6
+    val westX = startX + dx[6]
+    val westY = startY + dy[6]
+    if (westX in 0 until width && westY in 0 until height && isForeground(mask[westY * width + westX])) {
+      for (dir in 0 until 8) {
+        val bx = startX + dx[dir]
+        val by = startY + dy[dir]
+        if (bx !in 0 until width || by !in 0 until height || !isForeground(mask[by * width + bx])) {
+          backtrackDir = dir
+          break
+        }
+      }
+    }
+
     val boundary = ArrayList<ContourPoint>(512)
     var currX = startX
     var currY = startY
-    var backtrackDir = 6 // West
-
     boundary.add(ContourPoint(currX.toFloat(), currY.toFloat()))
-    val maxSteps = width * height
+
+    val maxSteps = maxStepsOverride ?: max(width * height * 2, 16)
+    val visitedDirectedEdges = HashSet<Long>(min(maxSteps, 2048))
+    var firstNextX = -1
+    var firstNextY = -1
+    var firstNextDir = -1
     var steps = 0
 
     while (steps < maxSteps) {
@@ -199,8 +240,55 @@ object ContourGeometry {
         }
       }
 
-      if (nextX == -1) break
-      if (nextX == startX && nextY == startY && boundary.size > 2) break
+      if (nextX == -1) {
+        val reason = if (steps == 1) {
+          BoundaryTerminationReason.ISOLATED_PIXEL
+        } else {
+          BoundaryTerminationReason.NO_NEIGHBOR
+        }
+        return BoundaryTraceResult(
+          points = boundary,
+          traceClosed = false,
+          terminationReason = reason,
+          steps = steps,
+        )
+      }
+
+      val edgeKey = (((currY * width + currX).toLong()) shl 3) or nextDir.toLong()
+      if (steps == 1) {
+        firstNextX = nextX
+        firstNextY = nextY
+        firstNextDir = nextDir
+        visitedDirectedEdges.add(edgeKey)
+      } else {
+        if (currX == startX && currY == startY && nextX == firstNextX && nextY == firstNextY && nextDir == firstNextDir) {
+          if (boundary.size > 1) {
+            val last = boundary.last()
+            if (last.x.toInt() == startX && last.y.toInt() == startY) {
+              boundary.removeAt(boundary.lastIndex)
+            }
+          }
+          val isClosedLoop = boundary.size >= 3
+          return BoundaryTraceResult(
+            points = boundary,
+            traceClosed = isClosedLoop,
+            terminationReason = if (isClosedLoop) {
+              BoundaryTerminationReason.RETURNED_TO_START
+            } else {
+              BoundaryTerminationReason.REPEATED_STATE
+            },
+            steps = steps,
+          )
+        }
+        if (!visitedDirectedEdges.add(edgeKey)) {
+          return BoundaryTraceResult(
+            points = boundary,
+            traceClosed = false,
+            terminationReason = BoundaryTerminationReason.REPEATED_STATE,
+            steps = steps,
+          )
+        }
+      }
 
       boundary.add(ContourPoint(nextX.toFloat(), nextY.toFloat()))
       currX = nextX
@@ -208,8 +296,25 @@ object ContourGeometry {
       backtrackDir = (nextDir + 4) % 8
     }
 
-    return boundary
+    return BoundaryTraceResult(
+      points = boundary,
+      traceClosed = false,
+      terminationReason = BoundaryTerminationReason.MAX_STEPS,
+      steps = steps,
+    )
   }
+
+  /**
+   * Moore-Neighbor Tracing algorithm to trace the exterior perimeter of the primary mask component.
+   */
+  fun extractBoundaryPoints(
+    mask: ByteArray,
+    width: Int,
+    height: Int,
+    startHintX: Int = -1,
+    startHintY: Int = -1,
+  ): List<ContourPoint> =
+    extractBoundaryTrace(mask, width, height, startHintX, startHintY).points
 
   private fun perpendicularDistance(p: ContourPoint, a: ContourPoint, b: ContourPoint): Float {
     val dx = b.x - a.x
@@ -338,8 +443,9 @@ object ContourGeometry {
     val lcc = getLargestConnectedComponent(mask, width, height)
     if (lcc.pixelCount < 60) return null
 
-    val rawPoints = extractBoundaryPoints(lcc.cleanMask, width, height, lcc.startX, lcc.startY)
-    if (rawPoints.size < 3) return null
+    val trace = extractBoundaryTrace(lcc.cleanMask, width, height, lcc.startX, lcc.startY)
+    val rawPoints = trace.points
+    if (rawPoints.size < 3 || !trace.traceClosed) return null
 
     val clampedPasses = min(5, max(1, smoothingPasses))
     val smoothedRaw = smoothClosedContour(rawPoints, clampedPasses)
@@ -362,6 +468,8 @@ object ContourGeometry {
       simplifiedPointCount = finalSmoothed.size,
       extractionTimeMs = elapsed,
       internalGlint = glintOverlay,
+      traceClosed = trace.traceClosed,
+      terminationReason = trace.terminationReason,
     )
   }
 }

@@ -44,17 +44,30 @@ class SlimSamMaskDecoder {
   }
 
   private val mutex = Mutex()
+  private val gate = NativeSessionGate("SlimSamMaskDecoder")
   private var session: OrtSession? = null
+
+  @Volatile
+  internal var nativeRunObserver: ((String) -> Unit)? = null
+
+  @Volatile
+  internal var sessionClosedObserver: ((String) -> Unit)? = null
 
   @Volatile
   var contractSummary: String? = null
     private set
 
-  fun isLoaded(): Boolean = session != null
+  fun isLoaded(): Boolean = !gate.isClosingOrClosed() && session != null
+
+  fun isClosed(): Boolean = gate.isClosed()
+
+  fun activeOperationCount(): Int = gate.activeOperationCount()
 
   suspend fun ensureLoaded(modelFile: File) = withContext(Dispatchers.IO) {
+    if (gate.isClosingOrClosed()) throw CancellationException("SlimSamMaskDecoder is closed")
     if (session != null) return@withContext
     mutex.withLock {
+      if (gate.isClosingOrClosed()) throw CancellationException("SlimSamMaskDecoder is closed")
       if (session != null) return@withContext
       try {
         val env = OrtEnvironment.getEnvironment()
@@ -68,9 +81,15 @@ class SlimSamMaskDecoder {
         try {
           val summary = validateContract(created)
           runSmokeCheck(env, created)
-          contractSummary = summary
+          val published = gate.publishIfOpen {
+            contractSummary = summary
+            session = created
+          }
+          if (!published) {
+            runCatching { created.close() }
+            throw CancellationException("SlimSamMaskDecoder closed during load")
+          }
           Log.i(TAG, "Mask Decoder loaded, contract verified & smoke-checked: $summary")
-          session = created
         } catch (t: Throwable) {
           runCatching { created.close() }
           throw t
@@ -195,6 +214,7 @@ class SlimSamMaskDecoder {
         pointCoords = pts,
         pointLabels = lbls,
         pointCount = 1,
+        notifyObserver = false,
       )
     } catch (oe: OrtException) {
       val code = classifyOrtException(oe, defaultCode = SlimSamErrorCode.DECODER_FAILED)
@@ -212,21 +232,27 @@ class SlimSamMaskDecoder {
     require(pointCount > 0 && pointCoords.size == pointCount * 2 && pointLabels.size == pointCount) {
       "Invalid prompt tensor counts: pointCount=$pointCount, coords=${pointCoords.size}, labels=${pointLabels.size}"
     }
-    val activeSession = session ?: throw SlimSamRuntimeException(
-      SlimSamErrorCode.SESSION_CREATE_FAILED,
-      "Mask Decoder session is not loaded",
-    )
+    if (gate.isClosingOrClosed()) {
+      throw CancellationException("SlimSamMaskDecoder is closing or closed")
+    }
     val env = OrtEnvironment.getEnvironment()
     try {
-      executeSession(
-        env = env,
-        s = activeSession,
-        imageEmbeddings = embedding.imageEmbeddings,
-        positionalEmbeddings = embedding.imagePositionalEmbeddings,
-        pointCoords = pointCoords,
-        pointLabels = pointLabels,
-        pointCount = pointCount,
-      )
+      gate.withNativeOperation {
+        val activeSession = session ?: throw SlimSamRuntimeException(
+          SlimSamErrorCode.SESSION_CREATE_FAILED,
+          "Mask Decoder session is not loaded",
+        )
+        executeSession(
+          env = env,
+          s = activeSession,
+          imageEmbeddings = embedding.imageEmbeddings,
+          positionalEmbeddings = embedding.imagePositionalEmbeddings,
+          pointCoords = pointCoords,
+          pointLabels = pointLabels,
+          pointCount = pointCount,
+          notifyObserver = true,
+        )
+      }
     } catch (ce: CancellationException) {
       throw ce
     } catch (sre: SlimSamRuntimeException) {
@@ -251,6 +277,7 @@ class SlimSamMaskDecoder {
     pointCoords: FloatArray,
     pointLabels: LongArray,
     pointCount: Int,
+    notifyObserver: Boolean,
   ): SamDecoderOutput {
     val start = System.currentTimeMillis()
     val ptsShape = longArrayOf(1L, 1L, pointCount.toLong(), 2L)
@@ -267,6 +294,9 @@ class SlimSamMaskDecoder {
               INPUT_IMAGE_EMBEDDINGS to embTensor,
               INPUT_POSITIONAL_EMBEDDINGS to posTensor,
             )
+            if (notifyObserver) {
+              nativeRunObserver?.invoke("SLIMSAM_DECODER_RUN")
+            }
             s.run(feeds).use { results ->
               val iouTensor = results[OUTPUT_IOU_SCORES].orElse(null) as? OnnxTensor
                 ?: throw SlimSamRuntimeException(
@@ -316,8 +346,11 @@ class SlimSamMaskDecoder {
   }
 
   fun close() {
-    runCatching { session?.close() }
-    session = null
-    contractSummary = null
+    gate.closeIdempotent {
+      runCatching { session?.close() }
+      session = null
+      contractSummary = null
+      sessionClosedObserver?.invoke("CLOSE_SLIMSAM_DECODER_SESSION")
+    }
   }
 }

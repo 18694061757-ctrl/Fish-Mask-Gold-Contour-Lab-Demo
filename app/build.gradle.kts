@@ -85,6 +85,12 @@ android {
           testTask.dependsOn("prepareOrtHostNatives")
           testTask.systemProperty("onnxruntime.native.path", ortNativeDir.absolutePath)
         }
+        System.getProperty("fishmask.evidence.dir")?.let {
+          testTask.systemProperty("fishmask.evidence.dir", it)
+        }
+        System.getProperty("fishmask.webParityDir")?.let {
+          testTask.systemProperty("fishmask.webParityDir", it)
+        }
       }
     }
   }

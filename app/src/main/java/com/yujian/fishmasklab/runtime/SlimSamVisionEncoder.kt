@@ -49,17 +49,30 @@ class SlimSamVisionEncoder {
   }
 
   private val mutex = Mutex()
+  private val gate = NativeSessionGate("SlimSamVisionEncoder")
   private var session: OrtSession? = null
+
+  @Volatile
+  internal var nativeRunObserver: ((String) -> Unit)? = null
+
+  @Volatile
+  internal var sessionClosedObserver: ((String) -> Unit)? = null
 
   @Volatile
   var contractSummary: String? = null
     private set
 
-  fun isLoaded(): Boolean = session != null
+  fun isLoaded(): Boolean = !gate.isClosingOrClosed() && session != null
+
+  fun isClosed(): Boolean = gate.isClosed()
+
+  fun activeOperationCount(): Int = gate.activeOperationCount()
 
   suspend fun ensureLoaded(modelFile: File) = withContext(Dispatchers.IO) {
+    if (gate.isClosingOrClosed()) throw CancellationException("SlimSamVisionEncoder is closed")
     if (session != null) return@withContext
     mutex.withLock {
+      if (gate.isClosingOrClosed()) throw CancellationException("SlimSamVisionEncoder is closed")
       if (session != null) return@withContext
       try {
         val env = OrtEnvironment.getEnvironment()
@@ -71,9 +84,16 @@ class SlimSamVisionEncoder {
           env.createSession(modelFile.absolutePath, opts)
         }
         try {
-          contractSummary = validateContract(created)
-          Log.i(TAG, "Vision Encoder loaded & verified: $contractSummary")
-          session = created
+          val summary = validateContract(created)
+          val published = gate.publishIfOpen {
+            contractSummary = summary
+            session = created
+          }
+          if (!published) {
+            runCatching { created.close() }
+            throw CancellationException("SlimSamVisionEncoder closed during load")
+          }
+          Log.i(TAG, "Vision Encoder loaded & verified: $summary")
         } catch (t: Throwable) {
           runCatching { created.close() }
           throw t
@@ -148,47 +168,53 @@ class SlimSamVisionEncoder {
     require(pixelValues.size == 3 * INPUT_SIZE * INPUT_SIZE) {
       "Expected ${3 * INPUT_SIZE * INPUT_SIZE} floats for pixel_values, got ${pixelValues.size}"
     }
-    val activeSession = session ?: throw SlimSamRuntimeException(
-      SlimSamErrorCode.SESSION_CREATE_FAILED,
-      "Vision Encoder session is not loaded",
-    )
+    if (gate.isClosingOrClosed()) {
+      throw CancellationException("SlimSamVisionEncoder is closing or closed")
+    }
     val env = OrtEnvironment.getEnvironment()
     val start = System.currentTimeMillis()
     val shape = longArrayOf(1L, 3L, INPUT_SIZE.toLong(), INPUT_SIZE.toLong())
 
     try {
-      OnnxTensor.createTensor(env, FloatBuffer.wrap(pixelValues), shape).use { inputTensor ->
-        ensureActive()
-        activeSession.run(mapOf(INPUT_PIXEL_VALUES to inputTensor)).use { results ->
+      gate.withNativeOperation {
+        val activeSession = session ?: throw SlimSamRuntimeException(
+          SlimSamErrorCode.SESSION_CREATE_FAILED,
+          "Vision Encoder session is not loaded",
+        )
+        OnnxTensor.createTensor(env, FloatBuffer.wrap(pixelValues), shape).use { inputTensor ->
           ensureActive()
-          val embTensor = results[OUTPUT_IMAGE_EMBEDDINGS].orElse(null) as? OnnxTensor
-            ?: throw SlimSamRuntimeException(
-              SlimSamErrorCode.ENCODER_FAILED,
-              "Missing '$OUTPUT_IMAGE_EMBEDDINGS' tensor",
+          nativeRunObserver?.invoke("SLIMSAM_ENCODER_RUN")
+          activeSession.run(mapOf(INPUT_PIXEL_VALUES to inputTensor)).use { results ->
+            ensureActive()
+            val embTensor = results[OUTPUT_IMAGE_EMBEDDINGS].orElse(null) as? OnnxTensor
+              ?: throw SlimSamRuntimeException(
+                SlimSamErrorCode.ENCODER_FAILED,
+                "Missing '$OUTPUT_IMAGE_EMBEDDINGS' tensor",
+              )
+            val posTensor = results[OUTPUT_POSITIONAL_EMBEDDINGS].orElse(null) as? OnnxTensor
+              ?: throw SlimSamRuntimeException(
+                SlimSamErrorCode.ENCODER_FAILED,
+                "Missing '$OUTPUT_POSITIONAL_EMBEDDINGS' tensor",
+              )
+
+            val embShape = embTensor.info.shape
+            val posShape = posTensor.info.shape
+            val embeddings = FloatArray(SamImageEmbedding.ELEMENT_COUNT)
+            val positional = FloatArray(SamImageEmbedding.ELEMENT_COUNT)
+            embTensor.floatBuffer.get(embeddings)
+            posTensor.floatBuffer.get(positional)
+
+            verifyFinite(embeddings, OUTPUT_IMAGE_EMBEDDINGS)
+            verifyFinite(positional, OUTPUT_POSITIONAL_EMBEDDINGS)
+
+            SamImageEmbedding(
+              imageEmbeddings = embeddings,
+              imagePositionalEmbeddings = positional,
+              embeddingsShape = embShape,
+              positionalShape = posShape,
+              encoderDurationMs = (System.currentTimeMillis() - start).coerceAtLeast(0L),
             )
-          val posTensor = results[OUTPUT_POSITIONAL_EMBEDDINGS].orElse(null) as? OnnxTensor
-            ?: throw SlimSamRuntimeException(
-              SlimSamErrorCode.ENCODER_FAILED,
-              "Missing '$OUTPUT_POSITIONAL_EMBEDDINGS' tensor",
-            )
-
-          val embShape = embTensor.info.shape
-          val posShape = posTensor.info.shape
-          val embeddings = FloatArray(SamImageEmbedding.ELEMENT_COUNT)
-          val positional = FloatArray(SamImageEmbedding.ELEMENT_COUNT)
-          embTensor.floatBuffer.get(embeddings)
-          posTensor.floatBuffer.get(positional)
-
-          verifyFinite(embeddings, OUTPUT_IMAGE_EMBEDDINGS)
-          verifyFinite(positional, OUTPUT_POSITIONAL_EMBEDDINGS)
-
-          SamImageEmbedding(
-            imageEmbeddings = embeddings,
-            imagePositionalEmbeddings = positional,
-            embeddingsShape = embShape,
-            positionalShape = posShape,
-            encoderDurationMs = (System.currentTimeMillis() - start).coerceAtLeast(0L),
-          )
+          }
         }
       }
     } catch (ce: CancellationException) {
@@ -219,9 +245,12 @@ class SlimSamVisionEncoder {
   }
 
   fun close() {
-    runCatching { session?.close() }
-    session = null
-    contractSummary = null
+    gate.closeIdempotent {
+      runCatching { session?.close() }
+      session = null
+      contractSummary = null
+      sessionClosedObserver?.invoke("CLOSE_SLIMSAM_ENCODER_SESSION")
+    }
   }
 }
 

@@ -12,17 +12,23 @@ import com.yujian.fishmasklab.domain.MaskQualityGate
 import com.yujian.fishmasklab.domain.MaskResult
 import com.yujian.fishmasklab.domain.PipelineState
 import com.yujian.fishmasklab.domain.RecognitionErrorReason
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
 sealed class PipelineProgressEvent {
@@ -54,9 +60,24 @@ class RecognitionPipelineCoordinator(
     private const val INFERENCE_TIMEOUT_MS = 35_000L
   }
 
-  private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+  private val scopeJob = SupervisorJob()
+  private val scope = CoroutineScope(scopeJob + Dispatchers.Default)
   private val taskIdCounter = AtomicLong(0L)
+  private val taskLock = Any()
+  private val shutdownStarted = AtomicBoolean(false)
+  private val nativeClosed = AtomicBoolean(false)
   private var activeJob: Job? = null
+
+  @Volatile
+  private var shutdownCompleteFlag: Boolean = false
+
+  @Volatile
+  var currentShutdownPhase: ShutdownPhase = ShutdownPhase.RUNNING
+    private set
+
+  private val _lifecycleLog = Collections.synchronizedList(mutableListOf(ShutdownPhase.RUNNING.name))
+  val lifecycleLog: List<String>
+    get() = synchronized(_lifecycleLog) { _lifecycleLog.toList() }
 
   private val _auditReport = MutableStateFlow<ModelAssetAuditReport?>(null)
   val auditReport: StateFlow<ModelAssetAuditReport?> = _auditReport.asStateFlow()
@@ -64,14 +85,29 @@ class RecognitionPipelineCoordinator(
   private val _events = MutableStateFlow<PipelineProgressEvent?>(null)
   val events: StateFlow<PipelineProgressEvent?> = _events.asStateFlow()
 
+  fun isShutdownRequested(): Boolean = shutdownStarted.get()
+
+  fun isShutdownComplete(): Boolean = shutdownCompleteFlag
+
+  internal fun recordPhase(phase: ShutdownPhase) {
+    currentShutdownPhase = phase
+    synchronized(_lifecycleLog) {
+      if (_lifecycleLog.lastOrNull() != phase.name) {
+        _lifecycleLog.add(phase.name)
+      }
+    }
+  }
+
   /**
    * Non-blocking startup warmup of local ONNX assets. Never blocks the EMPTY home screen.
    */
   fun warmupInBackground() {
+    if (shutdownStarted.get()) return
     scope.launch {
+      if (shutdownStarted.get()) return@launch
       val report = slimSamSegmenter.ensureLoaded()
       _auditReport.value = report
-      if (report.isYoloxReady) {
+      if (report.isYoloxReady && !shutdownStarted.get()) {
         yoloxDetector.ensureLoaded()
       }
       RuntimeTelemetry.capture(taskId = 0L)
@@ -82,12 +118,11 @@ class RecognitionPipelineCoordinator(
    * Cancels the currently active recognition job (if any) and returns its [Job] handle
    * so callers can safely await completion before recycling shared Bitmaps.
    */
-  fun cancelCurrentTask(): Job? {
+  fun cancelCurrentTask(): Job? = synchronized(taskLock) {
     taskIdCounter.incrementAndGet()
     val job = activeJob
     job?.cancel()
-    activeJob = null
-    return job
+    job
   }
 
   fun startRecognition(
@@ -98,13 +133,26 @@ class RecognitionPipelineCoordinator(
     tapPoint: ContourPoint? = null,
     existingDetection: FishDetection? = null,
   ): Long {
-    val taskId = taskIdCounter.incrementAndGet()
-    activeJob?.cancel()
+    if (shutdownStarted.get()) {
+      return -1L
+    }
+    return synchronized(taskLock) {
+      if (shutdownStarted.get()) {
+        return@synchronized -1L
+      }
+      val taskId = taskIdCounter.incrementAndGet()
+      val prevJob = activeJob
+      prevJob?.cancel()
 
-    activeJob = scope.launch {
-      try {
-        emitIfCurrent(taskId, photoGenerationId, PipelineState.PHOTO_SELECTED)
-        ensureActive()
+      val newJob = scope.launch {
+        try {
+          runCatching { prevJob?.cancelAndJoin() }
+          ensureActive()
+          if (shutdownStarted.get() || taskIdCounter.get() != taskId) {
+            return@launch
+          }
+          emitIfCurrent(taskId, photoGenerationId, PipelineState.PHOTO_SELECTED)
+          ensureActive()
 
         // Step 1: Ensure models are loaded, verified, and contract-checked
         emitIfCurrent(taskId, photoGenerationId, PipelineState.MODEL_LOADING)
@@ -390,9 +438,10 @@ class RecognitionPipelineCoordinator(
           detail = e.message ?: e.javaClass.simpleName,
         )
       }
+      }
+      activeJob = newJob
+      taskId
     }
-
-    return taskId
   }
 
   private fun emitIfCurrent(
@@ -405,7 +454,7 @@ class RecognitionPipelineCoordinator(
     telemetry: RuntimePerformanceSnapshot? = null,
     reusedEncoderEmbedding: Boolean = false,
   ) {
-    if (taskIdCounter.get() != taskId) return
+    if (shutdownStarted.get() || taskIdCounter.get() != taskId) return
     _events.value = PipelineProgressEvent.StateChanged(
       taskId = taskId,
       photoGenerationId = photoGenerationId,
@@ -426,7 +475,7 @@ class RecognitionPipelineCoordinator(
     detail: String? = null,
     telemetry: RuntimePerformanceSnapshot? = null,
   ) {
-    if (taskIdCounter.get() != taskId) return
+    if (shutdownStarted.get() || taskIdCounter.get() != taskId) return
     _events.value = PipelineProgressEvent.StateChanged(
       taskId = taskId,
       photoGenerationId = photoGenerationId,
@@ -438,9 +487,76 @@ class RecognitionPipelineCoordinator(
     )
   }
 
+  /**
+   * Idempotently initiates shutdown: stops accepting new tasks and cancels active recognition jobs
+   * without prematurely closing native ONNX sessions while native calls may still be running.
+   */
+  fun beginShutdown() {
+    if (shutdownStarted.compareAndSet(false, true)) {
+      recordPhase(ShutdownPhase.SHUTDOWN_REQUESTED)
+      recordPhase(ShutdownPhase.STOP_ACCEPTING_NEW_TASKS)
+      cancelCurrentTask()
+      recordPhase(ShutdownPhase.CANCEL_ACTIVE_RECOGNITION)
+      scopeJob.cancel()
+    }
+  }
+
+  /**
+   * Suspends until all coroutines in the coordinator scope (including any in-flight `OrtSession.run`)
+   * have completely exited.
+   */
+  suspend fun awaitAllNativeOperations() {
+    beginShutdown()
+    withContext(NonCancellable) {
+      scopeJob.join()
+    }
+    recordPhase(ShutdownPhase.WAIT_ALL_NATIVE_OPERATIONS)
+  }
+
+  /**
+   * Closes cached embeddings and native ONNX sessions in strict deterministic order after
+   * [awaitAllNativeOperations] completes, then optionally recycles Bitmaps and marks completion.
+   */
+  suspend fun closeNativeResources(
+    recycleBitmaps: (() -> Unit)? = null,
+  ) {
+    if (nativeClosed.compareAndSet(false, true)) {
+      withContext(NonCancellable) {
+        slimSamSegmenter.clearPhotoEmbeddingCache()
+        recordPhase(ShutdownPhase.CLEAR_ENCODER_EMBEDDING_CACHE)
+
+        yoloxDetector.close()
+        recordPhase(ShutdownPhase.CLOSE_YOLOX_SESSION)
+
+        slimSamSegmenter.closeEncoder()
+        recordPhase(ShutdownPhase.CLOSE_SLIMSAM_ENCODER_SESSION)
+
+        slimSamSegmenter.closeDecoder()
+        recordPhase(ShutdownPhase.CLOSE_SLIMSAM_DECODER_SESSION)
+
+        slimSamSegmenter.close()
+
+        recycleBitmaps?.invoke()
+
+        shutdownCompleteFlag = true
+        recordPhase(ShutdownPhase.SHUTDOWN_COMPLETE)
+      }
+    }
+  }
+
+  suspend fun shutdownAndAwait(
+    recycleBitmaps: (() -> Unit)? = null,
+  ) {
+    beginShutdown()
+    awaitAllNativeOperations()
+    closeNativeResources(recycleBitmaps = recycleBitmaps)
+  }
+
   fun shutdown() {
-    cancelCurrentTask()
-    yoloxDetector.close()
-    slimSamSegmenter.close()
+    beginShutdown()
+    runBlocking(Dispatchers.IO) {
+      awaitAllNativeOperations()
+      closeNativeResources()
+    }
   }
 }

@@ -17,15 +17,23 @@ import com.yujian.fishmasklab.domain.RecognitionErrorReason
 import com.yujian.fishmasklab.runtime.PipelineProgressEvent
 import com.yujian.fishmasklab.runtime.RecognitionPipelineCoordinator
 import com.yujian.fishmasklab.runtime.RuntimeTelemetry
+import com.yujian.fishmasklab.runtime.ShutdownPhase
 import com.yujian.fishmasklab.runtime.SlimSamSegmenter
 import com.yujian.fishmasklab.runtime.YoloxFishDetector
 import java.io.File
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 data class FishMaskUiState(
@@ -61,14 +69,26 @@ data class FishMaskUiState(
     get() = pipelineState == PipelineState.PLAYING || pipelineState == PipelineState.RESULT
 }
 
-class FishMaskViewModel(application: Application) : AndroidViewModel(application) {
+class FishMaskViewModel internal constructor(
+  application: Application,
+  internal val yoloxDetector: YoloxFishDetector,
+  internal val slimSamSegmenter: SlimSamSegmenter,
+  internal val coordinator: RecognitionPipelineCoordinator = RecognitionPipelineCoordinator(yoloxDetector, slimSamSegmenter),
+) : AndroidViewModel(application) {
 
-  private val yoloxDetector = YoloxFishDetector(application.applicationContext)
-  private val slimSamSegmenter = SlimSamSegmenter(application.applicationContext)
-  private val coordinator = RecognitionPipelineCoordinator(yoloxDetector, slimSamSegmenter)
+  constructor(application: Application) : this(
+    application = application,
+    yoloxDetector = YoloxFishDetector(application.applicationContext),
+    slimSamSegmenter = SlimSamSegmenter(application.applicationContext),
+  )
 
   private val _uiState = MutableStateFlow(FishMaskUiState())
   val uiState: StateFlow<FishMaskUiState> = _uiState.asStateFlow()
+
+  private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+  private val pendingCleanupJobs = Collections.synchronizedList(mutableListOf<Job>())
+  private val shutdownLock = Any()
+  private var shutdownJob: Job? = null
 
   private val photoGenerationCounter = AtomicLong(0L)
   private var workBitmap: Bitmap? = null
@@ -142,10 +162,16 @@ class FishMaskViewModel(application: Application) : AndroidViewModel(application
     loadAndRecognize { ExifPhotoLoader.loadFromFileAndDeleteTemp(file) }
   }
 
+  internal fun loadPhotoWithLoaderForTest(loader: suspend () -> LoadedFishPhoto) {
+    loadAndRecognize(loader)
+  }
+
   private fun loadAndRecognize(loader: suspend () -> LoadedFishPhoto) {
+    if (coordinator.isShutdownRequested()) return
     val generationId = photoGenerationCounter.incrementAndGet()
     val prevJob = coordinator.cancelCurrentTask()
-    loadJob?.cancel()
+    val prevLoadJob = loadJob
+    prevLoadJob?.cancel()
     currentDetection = null
 
     val oldDisplay = _uiState.value.displayBitmap
@@ -167,14 +193,20 @@ class FishMaskViewModel(application: Application) : AndroidViewModel(application
     }
 
     loadJob = viewModelScope.launch {
-      // Wait for any cancelled native ORT job to finish before releasing cached embeddings & Bitmaps
+      // Wait for any cancelled load or native ORT job to finish before releasing cached embeddings & Bitmaps
+      runCatching { prevLoadJob?.join() }
       runCatching { prevJob?.join() }
       slimSamSegmenter.clearPhotoEmbeddingCache()
       recycleSafely(oldDisplay, oldWork)
 
+      ensureActive()
+      if (photoGenerationCounter.get() != generationId || coordinator.isShutdownRequested()) {
+        return@launch
+      }
+
       try {
         val loaded = loader()
-        if (photoGenerationCounter.get() != generationId) {
+        if (!isActive || photoGenerationCounter.get() != generationId || coordinator.isShutdownRequested()) {
           recycleSafely(loaded.displayBitmap, loaded.workBitmap)
           return@launch
         }
@@ -191,7 +223,7 @@ class FishMaskViewModel(application: Application) : AndroidViewModel(application
             replayToken = it.replayToken + 1,
           )
         }
-        activeTaskId = coordinator.startRecognition(
+        val startedTaskId = coordinator.startRecognition(
           photoGenerationId = generationId,
           workBitmap = loaded.workBitmap,
           samBitmap = loaded.displayBitmap,
@@ -199,8 +231,15 @@ class FishMaskViewModel(application: Application) : AndroidViewModel(application
           tapPoint = null,
           existingDetection = null,
         )
+        if (startedTaskId < 0L) {
+          workBitmap = null
+          _uiState.update { curr -> curr.copy(displayBitmap = null, coordinateMapper = null) }
+          recycleSafely(loaded.displayBitmap, loaded.workBitmap)
+          return@launch
+        }
+        activeTaskId = startedTaskId
       } catch (e: Exception) {
-        if (photoGenerationCounter.get() == generationId) {
+        if (isActive && photoGenerationCounter.get() == generationId && !coordinator.isShutdownRequested()) {
           _uiState.update {
             it.copy(
               pipelineState = PipelineState.ERROR,
@@ -219,6 +258,7 @@ class FishMaskViewModel(application: Application) : AndroidViewModel(application
    * and reuses the cached Encoder embedding + current FishDetection without re-running YOLOX/Encoder.
    */
   fun onTapViewport(tapX: Float, tapY: Float, viewportWidth: Float, viewportHeight: Float) {
+    if (coordinator.isShutdownRequested()) return
     val state = _uiState.value
     if (!state.isResultVisible) return
     val mapper = state.coordinateMapper ?: return
@@ -235,7 +275,16 @@ class FishMaskViewModel(application: Application) : AndroidViewModel(application
     }
 
     val generationId = state.photoGenerationId
-    coordinator.cancelCurrentTask()
+    val startedTaskId = coordinator.startRecognition(
+      photoGenerationId = generationId,
+      workBitmap = work,
+      samBitmap = display,
+      mapper = mapper,
+      tapPoint = origPoint,
+      existingDetection = detection,
+    )
+    if (startedTaskId < 0L) return
+    activeTaskId = startedTaskId
     _uiState.update {
       it.copy(
         pipelineState = PipelineState.PROMPT_BUILDING,
@@ -245,14 +294,6 @@ class FishMaskViewModel(application: Application) : AndroidViewModel(application
         replayToken = it.replayToken + 1,
       )
     }
-    activeTaskId = coordinator.startRecognition(
-      photoGenerationId = generationId,
-      workBitmap = work,
-      samBitmap = display,
-      mapper = mapper,
-      tapPoint = origPoint,
-      existingDetection = detection,
-    )
   }
 
   /**
@@ -286,7 +327,9 @@ class FishMaskViewModel(application: Application) : AndroidViewModel(application
   fun cancelAndResetToEmpty() {
     photoGenerationCounter.incrementAndGet()
     val prevJob = coordinator.cancelCurrentTask()
-    loadJob?.cancel()
+    val prevLoadJob = loadJob
+    prevLoadJob?.cancel()
+    loadJob = null
     currentDetection = null
     val oldDisplay = _uiState.value.displayBitmap
     val oldWork = workBitmap
@@ -299,28 +342,85 @@ class FishMaskViewModel(application: Application) : AndroidViewModel(application
       )
     }
 
-    viewModelScope.launch {
+    if (coordinator.isShutdownRequested()) {
+      return
+    }
+
+    val job = cleanupScope.launch {
+      runCatching { prevLoadJob?.join() }
       runCatching { prevJob?.join() }
       slimSamSegmenter.clearPhotoEmbeddingCache()
       recycleSafely(oldDisplay, oldWork)
     }
+    pendingCleanupJobs.add(job)
+    job.invokeOnCompletion { pendingCleanupJobs.remove(job) }
   }
 
+  private val bitmapRecycleLock = Any()
+
   private fun recycleSafely(vararg bitmaps: Bitmap?) {
-    for (bmp in bitmaps) {
-      if (bmp != null && !bmp.isRecycled) {
-        bmp.recycle()
+    synchronized(bitmapRecycleLock) {
+      for (bmp in bitmaps) {
+        if (bmp != null && !bmp.isRecycled) {
+          bmp.recycle()
+        }
       }
     }
   }
 
+  internal fun shutdownAsync(): Job {
+    synchronized(shutdownLock) {
+      shutdownJob?.let { return it }
+      photoGenerationCounter.incrementAndGet()
+      coordinator.beginShutdown()
+      val pendingLoadJob = loadJob
+      pendingLoadJob?.cancel()
+      loadJob = null
+      currentDetection = null
+      val oldDisplay = _uiState.value.displayBitmap
+      val oldWork = workBitmap
+      workBitmap = null
+      _uiState.update {
+        it.copy(
+          displayBitmap = null,
+          coordinateMapper = null,
+          contourData = null,
+        )
+      }
+
+      val job = cleanupScope.launch {
+        try {
+          coordinator.awaitAllNativeOperations()
+          val resetCleanups = synchronized(pendingCleanupJobs) {
+            pendingCleanupJobs.toList().also { pendingCleanupJobs.clear() }
+          }
+          resetCleanups.forEach { runCatching { it.join() } }
+          runCatching { pendingLoadJob?.join() }
+          coordinator.recordPhase(ShutdownPhase.WAIT_VIEWMODEL_LOAD_JOB)
+          coordinator.closeNativeResources(
+            recycleBitmaps = {
+              recycleSafely(oldDisplay)
+              coordinator.recordPhase(ShutdownPhase.RECYCLE_DISPLAY_BITMAP)
+              recycleSafely(oldWork)
+              coordinator.recordPhase(ShutdownPhase.RECYCLE_WORK_BITMAP)
+            },
+          )
+        } finally {
+          cleanupScope.cancel()
+        }
+      }
+      shutdownJob = job
+      return job
+    }
+  }
+
+  internal suspend fun clearForTestAndAwait() {
+    onCleared()
+    shutdownAsync().join()
+  }
+
   override fun onCleared() {
     super.onCleared()
-    loadJob?.cancel()
-    coordinator.shutdown()
-    val oldDisplay = _uiState.value.displayBitmap
-    val oldWork = workBitmap
-    workBitmap = null
-    recycleSafely(oldDisplay, oldWork)
+    shutdownAsync()
   }
 }

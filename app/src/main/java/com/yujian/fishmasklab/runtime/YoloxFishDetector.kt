@@ -44,6 +44,13 @@ class YoloxFishDetector(
   }
 
   private val loadMutex = Mutex()
+  private val gate = NativeSessionGate("YoloxFishDetector")
+
+  @Volatile
+  internal var nativeRunObserver: ((String) -> Unit)? = null
+
+  @Volatile
+  internal var sessionClosedObserver: ((String) -> Unit)? = null
 
   @Volatile
   var status: ModelRuntimeStatus = ModelRuntimeStatus.NOT_LOADED
@@ -60,18 +67,23 @@ class YoloxFishDetector(
   private var ortEnv: OrtEnvironment? = null
   private var session: OrtSession? = null
 
-  fun isReady(): Boolean = status == ModelRuntimeStatus.READY && session != null
+  fun isReady(): Boolean = !gate.isClosingOrClosed() && status == ModelRuntimeStatus.READY && session != null
+
+  fun isClosed(): Boolean = gate.isClosed()
+
+  fun activeOperationCount(): Int = gate.activeOperationCount()
 
   suspend fun ensureLoaded(): Boolean = withContext(Dispatchers.IO) {
+    if (gate.isClosingOrClosed()) return@withContext false
     if (isReady()) return@withContext true
     loadMutex.withLock {
+      if (gate.isClosingOrClosed()) return@withContext false
       if (isReady()) return@withContext true
       status = ModelRuntimeStatus.WARMING_UP
       lastError = null
       val start = System.currentTimeMillis()
       try {
         val env = OrtEnvironment.getEnvironment()
-        ortEnv = env
 
         // Copy to app cache once to allow file-backed OrtSession creation without holding full byte[] in Java heap
         val cachedModelFile = File(context.cacheDir, "ort_yolox_nano_v0_1.onnx")
@@ -93,11 +105,20 @@ class YoloxFishDetector(
           }
         }
 
-        session = options.use { opts ->
+        val created = options.use { opts ->
           env.createSession(cachedModelFile.absolutePath, opts)
         }
-        loadDurationMs = System.currentTimeMillis() - start
-        status = ModelRuntimeStatus.READY
+        val published = gate.publishIfOpen {
+          ortEnv = env
+          session = created
+          loadDurationMs = System.currentTimeMillis() - start
+          status = ModelRuntimeStatus.READY
+        }
+        if (!published) {
+          runCatching { created.close() }
+          status = ModelRuntimeStatus.NOT_LOADED
+          return@withContext false
+        }
         Log.i(TAG, "YOLOX-Nano loaded on CPU in ${loadDurationMs}ms")
         true
       } catch (ce: CancellationException) {
@@ -117,14 +138,18 @@ class YoloxFishDetector(
     mapper: ImageCoordinateMapper,
   ): Pair<FishDetection?, Long> = withContext(Dispatchers.Default) {
     ensureActive()
+    if (gate.isClosingOrClosed()) {
+      throw CancellationException("YoloxFishDetector is closing or closed")
+    }
     if (sourceBitmap.isRecycled) {
       throw CancellationException("Source bitmap recycled before YOLOX detection")
     }
     if (!ensureLoaded()) {
+      if (gate.isClosingOrClosed()) {
+        throw CancellationException("YoloxFishDetector closed before detection")
+      }
       throw IllegalStateException(lastError ?: "YOLOX-Nano failed to initialize")
     }
-    val activeSession = session ?: throw IllegalStateException("YOLOX session is null")
-    val env = ortEnv ?: throw IllegalStateException("OrtEnvironment is null")
 
     val start = System.currentTimeMillis()
     val sourceW = mapper.origWidth
@@ -132,71 +157,79 @@ class YoloxFishDetector(
     val scale = min(INPUT_SIZE.toFloat() / sourceW, INPUT_SIZE.toFloat() / sourceH)
     val drawW = max(1, floor(sourceW * scale).toInt())
     val drawH = max(1, floor(sourceH * scale).toInt())
-
-    // Build resized bitmap proportionally for BGR extraction
-    val resized = Bitmap.createScaledBitmap(sourceBitmap, drawW, drawH, true)
     val planeSize = INPUT_SIZE * INPUT_SIZE
-    val tensorData = FloatArray(3 * planeSize) { LETTERBOX_FILL }
-    val pixels = IntArray(drawW * drawH)
-    try {
-      resized.getPixels(pixels, 0, drawW, 0, 0, drawW, drawH)
-      for (y in 0 until drawH) {
-        ensureActive()
-        val srcRow = y * drawW
-        val dstRow = y * INPUT_SIZE
-        for (x in 0 until drawW) {
-          val argb = pixels[srcRow + x]
-          val r = Color.red(argb).toFloat()
-          val g = Color.green(argb).toFloat()
-          val b = Color.blue(argb).toFloat()
-          val dstIdx = dstRow + x
-          // BGR channel order matching detectorService.ts
-          tensorData[dstIdx] = b
-          tensorData[planeSize + dstIdx] = g
-          tensorData[2 * planeSize + dstIdx] = r
-        }
-      }
-    } finally {
-      if (resized !== sourceBitmap && !resized.isRecycled) {
-        resized.recycle()
-      }
-    }
-
-    ensureActive()
-
-    val inputName = activeSession.inputNames.firstOrNull() ?: "images"
-    val outputName = activeSession.outputNames.firstOrNull() ?: "output"
-    val shape = longArrayOf(1L, 3L, INPUT_SIZE.toLong(), INPUT_SIZE.toLong())
-
     val rawDetections = ArrayList<FishDetection>(16)
 
-    OnnxTensor.createTensor(env, FloatBuffer.wrap(tensorData), shape).use { inputTensor ->
+    gate.withNativeOperation {
+      if (sourceBitmap.isRecycled) {
+        throw CancellationException("Source bitmap recycled during YOLOX detection")
+      }
+      val activeSession = session ?: throw IllegalStateException("YOLOX session is null")
+      val env = ortEnv ?: throw IllegalStateException("OrtEnvironment is null")
+
+      // Build resized bitmap proportionally for BGR extraction
+      val resized = Bitmap.createScaledBitmap(sourceBitmap, drawW, drawH, true)
+      val tensorData = FloatArray(3 * planeSize) { LETTERBOX_FILL }
+      val pixels = IntArray(drawW * drawH)
+      try {
+        resized.getPixels(pixels, 0, drawW, 0, 0, drawW, drawH)
+        for (y in 0 until drawH) {
+          ensureActive()
+          val srcRow = y * drawW
+          val dstRow = y * INPUT_SIZE
+          for (x in 0 until drawW) {
+            val argb = pixels[srcRow + x]
+            val r = Color.red(argb).toFloat()
+            val g = Color.green(argb).toFloat()
+            val b = Color.blue(argb).toFloat()
+            val dstIdx = dstRow + x
+            // BGR channel order matching detectorService.ts
+            tensorData[dstIdx] = b
+            tensorData[planeSize + dstIdx] = g
+            tensorData[2 * planeSize + dstIdx] = r
+          }
+        }
+      } finally {
+        if (resized !== sourceBitmap && !resized.isRecycled) {
+          resized.recycle()
+        }
+      }
+
       ensureActive()
-      activeSession.run(mapOf(inputName to inputTensor)).use { results ->
-        val outValue = results[outputName].orElse(null)
-          ?: throw IllegalStateException("Missing YOLOX output tensor '$outputName'")
-        val outTensor = outValue as? OnnxTensor
-          ?: throw IllegalStateException("Unexpected YOLOX output type")
-        val outShape = outTensor.info.shape
-        val numRows = if (outShape.size >= 2) outShape[1].toInt() else 0
-        val stride = if (outShape.size >= 3) outShape[2].toInt() else 6
-        val fb = outTensor.floatBuffer
 
-        for (i in 0 until numRows) {
-          val off = i * stride
-          val cx = fb.get(off)
-          val cy = fb.get(off + 1)
-          val w = fb.get(off + 2)
-          val h = fb.get(off + 3)
-          val obj = fb.get(off + 4)
-          val cls = fb.get(off + 5)
-          val conf = obj * cls
+      val inputName = activeSession.inputNames.firstOrNull() ?: "images"
+      val outputName = activeSession.outputNames.firstOrNull() ?: "output"
+      val shape = longArrayOf(1L, 3L, INPUT_SIZE.toLong(), INPUT_SIZE.toLong())
 
-          if (conf >= CONFIDENCE_THRESHOLD) {
-            val box = mapper.detectorBoxToOriginalBox(cx, cy, w, h, scale)
-            if (box.width > MIN_BOX_DIM_PX && box.height > MIN_BOX_DIM_PX) {
-              val areaRatio = box.area.toFloat() / max(1, sourceW * sourceH).toFloat()
-              rawDetections.add(FishDetection(box = box, confidence = conf, areaRatio = areaRatio))
+      OnnxTensor.createTensor(env, FloatBuffer.wrap(tensorData), shape).use { inputTensor ->
+        ensureActive()
+        nativeRunObserver?.invoke("YOLOX_RUN")
+        activeSession.run(mapOf(inputName to inputTensor)).use { results ->
+          val outValue = results[outputName].orElse(null)
+            ?: throw IllegalStateException("Missing YOLOX output tensor '$outputName'")
+          val outTensor = outValue as? OnnxTensor
+            ?: throw IllegalStateException("Unexpected YOLOX output type")
+          val outShape = outTensor.info.shape
+          val numRows = if (outShape.size >= 2) outShape[1].toInt() else 0
+          val stride = if (outShape.size >= 3) outShape[2].toInt() else 6
+          val fb = outTensor.floatBuffer
+
+          for (i in 0 until numRows) {
+            val off = i * stride
+            val cx = fb.get(off)
+            val cy = fb.get(off + 1)
+            val w = fb.get(off + 2)
+            val h = fb.get(off + 3)
+            val obj = fb.get(off + 4)
+            val cls = fb.get(off + 5)
+            val conf = obj * cls
+
+            if (conf >= CONFIDENCE_THRESHOLD) {
+              val box = mapper.detectorBoxToOriginalBox(cx, cy, w, h, scale)
+              if (box.width > MIN_BOX_DIM_PX && box.height > MIN_BOX_DIM_PX) {
+                val areaRatio = box.area.toFloat() / max(1, sourceW * sourceH).toFloat()
+                rawDetections.add(FishDetection(box = box, confidence = conf, areaRatio = areaRatio))
+              }
             }
           }
         }
@@ -235,8 +268,12 @@ class YoloxFishDetector(
   }
 
   fun close() {
-    runCatching { session?.close() }
-    session = null
-    status = ModelRuntimeStatus.NOT_LOADED
+    gate.closeIdempotent {
+      runCatching { session?.close() }
+      session = null
+      ortEnv = null
+      status = ModelRuntimeStatus.NOT_LOADED
+      sessionClosedObserver?.invoke("CLOSE_YOLOX_SESSION")
+    }
   }
 }

@@ -42,6 +42,7 @@ data class SlimSamInferenceResult(
   val decoderDurationMs: Long,
   val postprocessDurationMs: Long,
   val reusedCachedEmbedding: Boolean,
+  internal val decoderOutput: SamDecoderOutput? = null,
 )
 
 /**
@@ -87,14 +88,27 @@ class SlimSamSegmenter(
   var processor: SlimSamImageProcessor? = null
     private set
 
+  @Volatile
+  private var closed: Boolean = false
+
+  @Volatile
   private var cachedPhotoContext: CachedSamPhotoEmbedding? = null
 
+  @Volatile
+  internal var lastInferenceResultForTest: SlimSamInferenceResult? = null
+    private set
+
+  internal fun getCachedPhotoContextForTest(): CachedSamPhotoEmbedding? = cachedPhotoContext
+
   fun isReady(): Boolean =
-    status == ModelRuntimeStatus.READY &&
+    !closed &&
+      status == ModelRuntimeStatus.READY &&
       modelState == SlimSamModelState.READY &&
       encoder.isLoaded() &&
       decoder.isLoaded() &&
       processor != null
+
+  fun isClosed(): Boolean = closed && encoder.isClosed() && decoder.isClosed()
 
   suspend fun hasCachedEmbeddingForPhoto(photoKey: Long): Boolean = cacheMutex.withLock {
     cachedPhotoContext?.photoKey == photoKey
@@ -102,14 +116,21 @@ class SlimSamSegmenter(
 
   suspend fun clearPhotoEmbeddingCache() = cacheMutex.withLock {
     cachedPhotoContext = null
+    lastInferenceResultForTest = null
   }
 
   suspend fun ensureLoaded(): ModelAssetAuditReport = withContext(Dispatchers.IO) {
+    if (closed) {
+      throw CancellationException("SlimSamSegmenter is closed")
+    }
     val existingAudit = auditReport
     if (isReady() && existingAudit != null) {
       return@withContext existingAudit
     }
     loadMutex.withLock {
+      if (closed) {
+        throw CancellationException("SlimSamSegmenter is closed")
+      }
       val cachedAudit = auditReport
       if (isReady() && cachedAudit != null) {
         return@withContext cachedAudit
@@ -209,6 +230,9 @@ class SlimSamSegmenter(
     onStage: (SlimSamStage) -> Unit = {},
   ): Pair<CachedSamPhotoEmbedding, Boolean> = withContext(Dispatchers.Default) {
     ensureActive()
+    if (closed) {
+      throw CancellationException("SlimSamSegmenter is closed")
+    }
     val report = ensureLoaded()
     val activeProcessor = processor
     if (!report.isSlimSamReady || !isReady() || activeProcessor == null) {
@@ -226,11 +250,18 @@ class SlimSamSegmenter(
       }
     }
 
+    if (photoBitmap.isRecycled) {
+      throw CancellationException("Photo bitmap recycled before SlimSAM preprocessing")
+    }
+
     modelState = SlimSamModelState.INFERENCE_RUNNING
     try {
       onStage(SlimSamStage.PREPROCESSING)
       val pre = activeProcessor.preprocess(photoBitmap)
       ensureActive()
+      if (closed) {
+        throw CancellationException("SlimSamSegmenter closed before Vision Encoder")
+      }
 
       onStage(SlimSamStage.ENCODER)
       val emb = encoder.encode(pre.pixelValues)
@@ -268,6 +299,9 @@ class SlimSamSegmenter(
     onStage: (SlimSamStage) -> Unit = {},
   ): SlimSamInferenceResult = withContext(Dispatchers.Default) {
     ensureActive()
+    if (closed) {
+      throw CancellationException("SlimSamSegmenter is closed")
+    }
     if (!isReady()) {
       throw ModelNotReadyException(
         missingAssets = auditReport?.missingAssets.orEmpty(),
@@ -327,7 +361,8 @@ class SlimSamSegmenter(
         decoderDurationMs = decoderOut.decoderDurationMs,
         postprocessDurationMs = postMs,
         reusedCachedEmbedding = reusedEmbedding,
-      )
+        decoderOutput = decoderOut,
+      ).also { lastInferenceResultForTest = it }
     } catch (ce: CancellationException) {
       modelState = SlimSamModelState.READY
       throw ce
@@ -447,10 +482,22 @@ class SlimSamSegmenter(
     return digest.digest().joinToString("") { "%02x".format(it) }
   }
 
+  fun closeEncoder() {
+    closed = true
+    encoder.close()
+  }
+
+  fun closeDecoder() {
+    closed = true
+    decoder.close()
+  }
+
   fun close() {
+    closed = true
+    cachedPhotoContext = null
+    lastInferenceResultForTest = null
     encoder.close()
     decoder.close()
-    cachedPhotoContext = null
     status = ModelRuntimeStatus.NOT_LOADED
     modelState = SlimSamModelState.NOT_READY
   }

@@ -100,6 +100,15 @@ data class GlintOverlayData(
   val argbPixels: IntArray,
 )
 
+enum class BoundaryTerminationReason {
+  RETURNED_TO_START,
+  ISOLATED_PIXEL,
+  NO_NEIGHBOR,
+  MAX_STEPS,
+  REPEATED_STATE,
+  INVALID_INPUT,
+}
+
 data class ContourData(
   val rawPoints: List<ContourPoint>,
   val simplifiedPoints: List<ContourPoint>,
@@ -110,6 +119,8 @@ data class ContourData(
   val simplifiedPointCount: Int,
   val extractionTimeMs: Long,
   val internalGlint: GlintOverlayData? = null,
+  val traceClosed: Boolean = true,
+  val terminationReason: BoundaryTerminationReason = BoundaryTerminationReason.RETURNED_TO_START,
 )
 
 /**
