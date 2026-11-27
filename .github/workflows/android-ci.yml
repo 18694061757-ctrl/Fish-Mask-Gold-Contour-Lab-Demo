@@ -1,0 +1,52 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main, "feat/**" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  android-build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Verify Gradle Wrapper
+        run: |
+          chmod +x gradlew
+          ./gradlew --version
+
+      - name: Verify Bundled ONNX Model Checksums
+        run: |
+          echo "98257b953b0e9f8aa673572fe4a9749a730ed8a2c014a42b7c492a0e3592c9a1  app/src/main/assets/models/fish_detector_yolox_nano_v0_1.onnx" | sha256sum -c -
+          echo "cce23c7b2e5d4f330932738fb67ba518e04b0d99ccdd1cccd22a7da4e01f2971  app/src/main/assets/models/slimsam/onnx/vision_encoder_quantized.onnx" | sha256sum -c -
+          echo "cb90b279f549d2cab7fd6e20c38522438c65d84bdcca3d2a764cff7d857fdce2  app/src/main/assets/models/slimsam/onnx/prompt_encoder_mask_decoder_quantized.onnx" | sha256sum -c -
+
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Compile Kotlin Debug Sources
+        run: ./gradlew :app:compileDebugKotlin
+
+      - name: Run Unit and Real ONNX Robolectric Tests
+        run: ./gradlew :app:testDebugUnitTest
+
+      - name: Build Debug APK
+        run: ./gradlew :app:assembleDebug
+
+      - name: Verify APK Contents and Assets
+        run: |
+          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK_PATH"
+          unzip -l "$APK_PATH" | grep "assets/models/fish_detector_yolox_nano_v0_1.onnx"
+          unzip -l "$APK_PATH" | grep "assets/models/slimsam/onnx/vision_encoder_quantized.onnx"
+          unzip -l "$APK_PATH" | grep "assets/models/slimsam/onnx/prompt_encoder_mask_decoder_quantized.onnx"
+          sha256sum "$APK_PATH"

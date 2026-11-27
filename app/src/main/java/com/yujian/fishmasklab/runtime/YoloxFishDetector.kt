@@ -117,6 +117,9 @@ class YoloxFishDetector(
     mapper: ImageCoordinateMapper,
   ): Pair<FishDetection?, Long> = withContext(Dispatchers.Default) {
     ensureActive()
+    if (sourceBitmap.isRecycled) {
+      throw CancellationException("Source bitmap recycled before YOLOX detection")
+    }
     if (!ensureLoaded()) {
       throw IllegalStateException(lastError ?: "YOLOX-Nano failed to initialize")
     }

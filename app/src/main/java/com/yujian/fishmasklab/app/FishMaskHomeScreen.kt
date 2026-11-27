@@ -561,8 +561,17 @@ private fun ProcessingStatusPill(
     PipelineState.PHOTO_SELECTED,
     PipelineState.MODEL_LOADING,
     -> stringResource(R.string.status_preparing_photo)
-    PipelineState.DETECTING -> stringResource(R.string.status_finding_fish)
-    PipelineState.SEGMENTING -> stringResource(R.string.status_segmenting_edge)
+    PipelineState.DETECTING,
+    PipelineState.YOLOX_RESULT_VALIDATION,
+    -> stringResource(R.string.status_finding_fish)
+    PipelineState.SAM_PREPROCESSING,
+    PipelineState.SAM_ENCODER,
+    PipelineState.PROMPT_BUILDING,
+    PipelineState.SAM_DECODER,
+    PipelineState.MASK_POSTPROCESSING,
+    PipelineState.MASK_CANDIDATE_RANKING,
+    PipelineState.MASK_QUALITY_GATE,
+    -> stringResource(R.string.status_segmenting_edge)
     PipelineState.BUILDING_CONTOUR -> stringResource(R.string.status_building_contour)
     PipelineState.PLAYING -> stringResource(R.string.status_lighting_catch)
     else -> stringResource(R.string.status_preparing_photo)

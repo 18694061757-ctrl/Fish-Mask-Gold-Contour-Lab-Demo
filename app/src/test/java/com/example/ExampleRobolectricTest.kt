@@ -31,13 +31,13 @@ class ExampleRobolectricTest {
   }
 
   @Test
-  fun `model asset audit detects bundled yolox and missing slimsam assets`() {
+  fun `model asset audit detects bundled yolox and verifies slimsam q8 assets`() {
     val context = ApplicationProvider.getApplicationContext<Context>()
     val report = ModelAssetAudit.runAudit(context.assets)
     assertTrue("YOLOX-Nano ONNX should be bundled and checksum verified", report.isYoloxReady)
-    assertFalse("SlimSAM ONNX weights should be reported NOT_READY when absent", report.isSlimSamReady)
-    assertTrue(report.missingAssets.contains(ModelAssetAudit.SLIMSAM_ENCODER_PATH))
-    assertTrue(report.missingAssets.contains(ModelAssetAudit.SLIMSAM_DECODER_PATH))
+    assertTrue("SlimSAM-77 Q8 ONNX and configs should be bundled and checksum verified", report.isSlimSamReady)
+    assertTrue("Expected no missing assets: ${report.missingAssets}", report.missingAssets.isEmpty())
+    assertTrue("Expected no SHA mismatches: ${report.shaMismatchedAssets}", report.shaMismatchedAssets.isEmpty())
   }
 
   @Test

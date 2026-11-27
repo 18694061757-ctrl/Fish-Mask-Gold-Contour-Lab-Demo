@@ -1,4 +1,5 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.util.zip.ZipFile
 
 plugins {
   alias(libs.plugins.android.application)
@@ -66,10 +67,62 @@ android {
   androidResources {
     noCompress += "onnx"
   }
-  testOptions { unitTests { isIncludeAndroidResources = true } }
+  testOptions {
+    unitTests {
+      isIncludeAndroidResources = true
+      all { testTask ->
+        val osName = System.getProperty("os.name").lowercase()
+        val osArch = System.getProperty("os.arch").lowercase()
+        val nativeSubdir = when {
+          osName.contains("linux") && (osArch.contains("amd64") || osArch.contains("x86_64")) -> "linux-x64"
+          osName.contains("linux") && (osArch.contains("aarch64") || osArch.contains("arm64")) -> "linux-aarch64"
+          osName.contains("mac") && (osArch.contains("aarch64") || osArch.contains("arm64")) -> "osx-arm64"
+          osName.contains("mac") -> "osx-x64"
+          else -> null
+        }
+        if (nativeSubdir != null) {
+          val ortNativeDir = layout.buildDirectory.dir("ort-host-natives/$nativeSubdir").get().asFile
+          testTask.dependsOn("prepareOrtHostNatives")
+          testTask.systemProperty("onnxruntime.native.path", ortNativeDir.absolutePath)
+        }
+      }
+    }
+  }
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true
+  }
+}
+
+val ortHostJniConfig by configurations.creating {
+  isCanBeConsumed = false
+  isCanBeResolved = true
+  isTransitive = false
+}
+
+tasks.register("prepareOrtHostNatives") {
+  val outDir = layout.buildDirectory.dir("ort-host-natives")
+  inputs.files(ortHostJniConfig)
+  outputs.dir(outDir)
+  val inputFiles = inputs.files
+  doLast {
+    val destRoot = outDir.get().asFile
+    inputFiles.forEach { jarFile ->
+      ZipFile(jarFile).use { zip ->
+        val entries = zip.entries()
+        while (entries.hasMoreElements()) {
+          val entry = entries.nextElement()
+          if (!entry.isDirectory && entry.name.startsWith("ai/onnxruntime/native/")) {
+            val rel = entry.name.removePrefix("ai/onnxruntime/native/")
+            val target = File(destRoot, rel)
+            target.parentFile?.mkdirs()
+            zip.getInputStream(entry).use { input ->
+              target.outputStream().use { output -> input.copyTo(output) }
+            }
+          }
+        }
+      }
+    }
   }
 }
 
@@ -137,6 +190,7 @@ dependencies {
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
   testImplementation(libs.robolectric)
+  ortHostJniConfig("com.microsoft.onnxruntime:onnxruntime:${libs.versions.onnxruntimeAndroid.get()}")
   androidTestImplementation(platform(libs.androidx.compose.bom))
   androidTestImplementation(libs.androidx.compose.ui.test.junit4)
   androidTestImplementation(libs.androidx.espresso.core)

@@ -5,11 +5,23 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+data class MappedSamPrompts(
+  val originalPrompts: List<PromptPoint>,
+  val samPointCoords: FloatArray, // [1, 1, N, 2] flattened (x_sam, y_sam)
+  val samPointLabels: LongArray,  // [1, 1, N] (1L or 0L)
+  val pointCount: Int,
+  val originalWidth: Int,
+  val originalHeight: Int,
+  val samResizedWidth: Int,
+  val samResizedHeight: Int,
+)
+
 /**
  * Immutable coordinate mapping across:
  * 1) Original EXIF-corrected photo pixels (`origWidth` x `origHeight`)
- * 2) Inference work image (`workWidth` x `workHeight`) with proportional letterbox scale
- * 3) Display viewport (`viewportWidth` x `viewportHeight`) with ContentScale.Fit rect
+ * 2) Inference work image (`workWidth` x `workHeight`) with proportional scale
+ * 3) SlimSAM resized image (`samResizedWidth` x `samResizedHeight`) before 1024x1024 zero-padding
+ * 4) Display viewport (`viewportWidth` x `viewportHeight`) with ContentScale.Fit rect
  */
 data class ImageCoordinateMapper(
   val origWidth: Int,
@@ -17,6 +29,9 @@ data class ImageCoordinateMapper(
   val workWidth: Int,
   val workHeight: Int,
   val workScale: Float,
+  val samResizedWidth: Int = computeSamResizedDims(origWidth, origHeight).first,
+  val samResizedHeight: Int = computeSamResizedDims(origWidth, origHeight).second,
+  val samScale: Double = 1024.0 / max(1, max(origWidth, origHeight)).toDouble(),
 ) {
   data class DisplayPhotoRect(
     val left: Float,
@@ -84,27 +99,91 @@ data class ImageCoordinateMapper(
   }
 
   /**
-   * Converts original pixel coordinates into SlimSAM reshaped input coordinates (longest side = [targetMaxSide]).
+   * Converts original pixel coordinates into SlimSAM reshaped input coordinates:
+   *   xSam = xOriginal * resizedWidth / originalWidth
+   *   ySam = yOriginal * resizedHeight / originalHeight
    */
-  fun originalPixelToSamPrompt(origX: Float, origY: Float, targetMaxSide: Int = 1024): Pair<Float, Float> {
-    val longest = max(origWidth, origHeight).coerceAtLeast(1)
-    val samScale = targetMaxSide.toFloat() / longest.toFloat()
-    return (origX * samScale) to (origY * samScale)
+  fun originalPixelToSamPrompt(
+    origX: Float,
+    origY: Float,
+    resizedWidth: Int = samResizedWidth,
+    resizedHeight: Int = samResizedHeight,
+  ): Pair<Float, Float> {
+    val safeOrigW = max(1, origWidth).toFloat()
+    val safeOrigH = max(1, origHeight).toFloat()
+    val xSam = (origX * resizedWidth.toFloat() / safeOrigW).coerceIn(0f, resizedWidth.toFloat())
+    val ySam = (origY * resizedHeight.toFloat() / safeOrigH).coerceIn(0f, resizedHeight.toFloat())
+    return xSam to ySam
+  }
+
+  /**
+   * Maps prompt points defined in original image pixel coordinates into SlimSAM decoder
+   * `input_points` ([1, 1, N, 2] Float32) and `input_labels` ([1, 1, N] Int64).
+   */
+  fun mapPromptsToSamSpace(
+    prompts: List<PromptPoint>,
+    resizedWidth: Int = samResizedWidth,
+    resizedHeight: Int = samResizedHeight,
+  ): MappedSamPrompts {
+    val coords = FloatArray(prompts.size * 2)
+    val labels = LongArray(prompts.size)
+    for (i in prompts.indices) {
+      val pt = prompts[i]
+      val (xSam, ySam) = originalPixelToSamPrompt(
+        origX = pt.x.toFloat(),
+        origY = pt.y.toFloat(),
+        resizedWidth = resizedWidth,
+        resizedHeight = resizedHeight,
+      )
+      coords[i * 2] = xSam
+      coords[i * 2 + 1] = ySam
+      labels[i] = pt.label.toLong()
+    }
+    return MappedSamPrompts(
+      originalPrompts = prompts,
+      samPointCoords = coords,
+      samPointLabels = labels,
+      pointCount = prompts.size,
+      originalWidth = origWidth,
+      originalHeight = origHeight,
+      samResizedWidth = resizedWidth,
+      samResizedHeight = resizedHeight,
+    )
   }
 
   companion object {
+    const val SAM_TARGET_MAX_SIDE = 1024
+
+    fun computeSamResizedDims(
+      origWidth: Int,
+      origHeight: Int,
+      targetMaxSide: Int = SAM_TARGET_MAX_SIDE,
+    ): Pair<Int, Int> {
+      val safeW = origWidth.coerceAtLeast(1)
+      val safeH = origHeight.coerceAtLeast(1)
+      val scale = targetMaxSide.toDouble() / max(safeW, safeH).toDouble()
+      val resizedW = floor(safeW * scale + 0.5).toInt().coerceIn(1, targetMaxSide)
+      val resizedH = floor(safeH * scale + 0.5).toInt().coerceIn(1, targetMaxSide)
+      return resizedW to resizedH
+    }
+
     fun create(origWidth: Int, origHeight: Int, maxWorkDimension: Int = 1024): ImageCoordinateMapper {
       val safeW = origWidth.coerceAtLeast(1)
       val safeH = origHeight.coerceAtLeast(1)
       val scale = min(1f, maxWorkDimension.toFloat() / max(safeW, safeH).toFloat())
       val workW = max(1, floor(safeW * scale).toInt())
       val workH = max(1, floor(safeH * scale).toInt())
+      val (samW, samH) = computeSamResizedDims(safeW, safeH, SAM_TARGET_MAX_SIDE)
+      val samScale = SAM_TARGET_MAX_SIDE.toDouble() / max(safeW, safeH).toDouble()
       return ImageCoordinateMapper(
         origWidth = safeW,
         origHeight = safeH,
         workWidth = workW,
         workHeight = workH,
         workScale = scale,
+        samResizedWidth = samW,
+        samResizedHeight = samH,
+        samScale = samScale,
       )
     }
   }

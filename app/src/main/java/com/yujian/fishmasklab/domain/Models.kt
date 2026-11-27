@@ -8,7 +8,14 @@ enum class PipelineState {
   PHOTO_SELECTED,
   MODEL_LOADING,
   DETECTING,
-  SEGMENTING,
+  YOLOX_RESULT_VALIDATION,
+  SAM_PREPROCESSING,
+  SAM_ENCODER,
+  PROMPT_BUILDING,
+  SAM_DECODER,
+  MASK_POSTPROCESSING,
+  MASK_CANDIDATE_RANKING,
+  MASK_QUALITY_GATE,
   BUILDING_CONTOUR,
   PLAYING,
   RESULT,
@@ -60,6 +67,7 @@ data class CandidateMask(
   val areaRatio: Float,
   val bbox: PixelBox,
   val isTrustworthy: Boolean = false,
+  val rankScore: Float = iouScore,
 )
 
 data class MaskResult(

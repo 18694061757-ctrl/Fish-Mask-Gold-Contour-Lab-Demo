@@ -5,16 +5,59 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Port of prompt generation, candidate scoring, and strict mask trustworthiness gating
- * from `src/services/samService.ts` and `src/App.tsx`.
+ * Port of prompt generation, 45% expanded detection box clipping, candidate scoring,
+ * and strict mask trustworthiness gating from `src/services/samService.ts` and `src/App.tsx`.
  */
 object MaskQualityGate {
+
+  const val DETECTION_CLIP_PADDING_RATIO = 0.45f
 
   fun isBboxTrustworthy(detection: FishDetection?): Boolean {
     if (detection == null) return false
     return detection.confidence >= 0.45f &&
       detection.box.width >= 35 &&
       detection.box.height >= 35
+  }
+
+  /**
+   * Computes the 45% expanded safety clipping box around a YOLOX fish detection box
+   * so long fins and tails stay intact while far background regions are excluded.
+   */
+  fun computeExpandedDetectionBox(
+    box: PixelBox,
+    imageWidth: Int,
+    imageHeight: Int,
+    paddingRatio: Float = DETECTION_CLIP_PADDING_RATIO,
+  ): PixelBox {
+    val padX = (box.width * paddingRatio).roundToInt()
+    val padY = (box.height * paddingRatio).roundToInt()
+    return PixelBox(
+      x1 = max(0, box.x1 - padX),
+      y1 = max(0, box.y1 - padY),
+      x2 = min(imageWidth, box.x2 + padX),
+      y2 = min(imageHeight, box.y2 + padY),
+    )
+  }
+
+  /**
+   * Checks whether a user tap-to-refocus point falls within the fish detection box (plus
+   * reasonable fin/tail padding) so tapping distant background does not target non-fish objects.
+   */
+  fun isTapWithinFishFocusRegion(
+    tapPoint: ContourPoint,
+    detection: FishDetection?,
+    imageWidth: Int,
+    imageHeight: Int,
+  ): Boolean {
+    if (tapPoint.x < 0f || tapPoint.y < 0f || tapPoint.x >= imageWidth || tapPoint.y >= imageHeight) {
+      return false
+    }
+    if (detection == null) return true
+    val expanded = computeExpandedDetectionBox(detection.box, imageWidth, imageHeight, 0.30f)
+    return tapPoint.x >= expanded.x1 &&
+      tapPoint.x <= expanded.x2 &&
+      tapPoint.y >= expanded.y1 &&
+      tapPoint.y <= expanded.y2
   }
 
   /**
@@ -90,6 +133,60 @@ object MaskQualityGate {
     )
   }
 
+  /**
+   * Applies 45% expanded detection box clipping in-place on [mask] (values 0 or 0xFF).
+   */
+  fun clipMaskWithExpandedDetectionBox(
+    mask: ByteArray,
+    width: Int,
+    height: Int,
+    detectionBox: PixelBox?,
+  ) {
+    if (detectionBox == null || width <= 0 || height <= 0 || mask.size < width * height) return
+    val clip = computeExpandedDetectionBox(detectionBox, width, height)
+    for (y in 0 until height) {
+      val rowOff = y * width
+      if (y < clip.y1 || y > clip.y2) {
+        for (x in 0 until width) {
+          mask[rowOff + x] = 0
+        }
+      } else {
+        for (x in 0 until clip.x1) {
+          mask[rowOff + x] = 0
+        }
+        for (x in (clip.x2 + 1) until width) {
+          mask[rowOff + x] = 0
+        }
+      }
+    }
+  }
+
+  /**
+   * Computes candidate ranking score matching `samService.ts`:
+   *   Score = 0.4 * IoU + 0.3 * Coverage + 0.3 * Span
+   */
+  fun computeCandidateScore(
+    iouScore: Float,
+    pixelCount: Int,
+    maskBbox: PixelBox,
+    detection: FishDetection?,
+  ): Float {
+    if (pixelCount <= 0) return -1f
+    if (detection == null) return iouScore
+    val targetW = max(1, detection.box.width).toFloat()
+    val targetH = max(1, detection.box.height).toFloat()
+    val targetArea = max(1f, targetW * targetH)
+    val coverage = min(pixelCount.toFloat() / (targetArea * 0.35f), 1.0f)
+    val spanH = min(maskBbox.height.toFloat() / max(1f, targetH * 0.7f), 1.0f)
+    val spanW = min(maskBbox.width.toFloat() / max(1f, targetW * 0.7f), 1.0f)
+    val span = spanH * spanW
+    return iouScore * 0.4f + coverage * 0.3f + span * 0.3f
+  }
+
+  /**
+   * Ranks candidates and returns the best index among trustworthy candidates (or best overall
+   * score if none are trustworthy).
+   */
   fun selectBestCandidateIndex(
     candidates: List<CandidateMask>,
     detection: FishDetection?,
@@ -97,30 +194,36 @@ object MaskQualityGate {
     imageHeight: Int,
   ): Int {
     if (candidates.isEmpty()) return 0
-    val targetArea = detection?.box?.area?.toFloat()
-      ?: (imageWidth.toFloat() * imageHeight.toFloat() * 0.15f)
 
-    var bestIdx = 0
-    var bestScore = -1f
+    var bestTrustworthyIdx = -1
+    var bestTrustworthyScore = -Float.MAX_VALUE
+    var bestOverallIdx = 0
+    var bestOverallScore = -Float.MAX_VALUE
+
     candidates.forEachIndexed { i, c ->
       if (c.pixelCount <= 0) return@forEachIndexed
-      val covRatio = c.pixelCount.toFloat() / max(1f, targetArea)
-      val sizeScore = min(covRatio / 0.35f, 1.0f) * min(1.8f / max(0.01f, covRatio), 1.0f)
-      val score = c.iouScore * 0.5f + sizeScore * 0.5f
-      if (score > bestScore) {
-        bestScore = score
-        bestIdx = i
+      val score = computeCandidateScore(c.iouScore, c.pixelCount, c.bbox, detection)
+      if (score > bestOverallScore) {
+        bestOverallScore = score
+        bestOverallIdx = i
+      }
+      if (c.isTrustworthy && score > bestTrustworthyScore) {
+        bestTrustworthyScore = score
+        bestTrustworthyIdx = i
       }
     }
-    return bestIdx
+
+    return if (bestTrustworthyIdx >= 0) bestTrustworthyIdx else bestOverallIdx
   }
 
-  fun evaluateMaskTrustworthiness(
+  /**
+   * Evaluates candidate geometry trustworthiness without requiring a pre-extracted ContourData.
+   */
+  fun evaluateCandidateGeometryTrustworthiness(
     candidate: CandidateMask?,
-    contour: ContourData?,
     detection: FishDetection?,
   ): Boolean {
-    if (candidate == null || contour == null || contour.rawPointCount < 20 || candidate.pixelCount < 60) {
+    if (candidate == null || candidate.pixelCount < 60) {
       return false
     }
     return if (detection != null) {
@@ -136,5 +239,16 @@ object MaskQualityGate {
     } else {
       candidate.pixelCount > 1000 && candidate.iouScore >= 0.65f
     }
+  }
+
+  fun evaluateMaskTrustworthiness(
+    candidate: CandidateMask?,
+    contour: ContourData?,
+    detection: FishDetection?,
+  ): Boolean {
+    if (candidate == null || contour == null || contour.rawPointCount < 20) {
+      return false
+    }
+    return evaluateCandidateGeometryTrustworthiness(candidate, detection)
   }
 }
