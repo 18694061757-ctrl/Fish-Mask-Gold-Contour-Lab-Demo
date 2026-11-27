@@ -6,6 +6,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtException
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
+import android.os.SystemClock
 import android.util.Log
 import java.io.File
 import java.nio.FloatBuffer
@@ -28,6 +29,8 @@ data class SamImageEmbedding(
   val embeddingsShape: LongArray,
   val positionalShape: LongArray,
   val encoderDurationMs: Long,
+  val encoderStartNs: Long = 0L,
+  val encoderEndNs: Long = 0L,
 ) {
   companion object {
     const val CHANNELS = 256
@@ -50,6 +53,7 @@ class SlimSamVisionEncoder {
 
   private val mutex = Mutex()
   private val gate = NativeSessionGate("SlimSamVisionEncoder")
+  val intraOpThreadCount: Int = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
   private var session: OrtSession? = null
 
   @Volatile
@@ -78,7 +82,7 @@ class SlimSamVisionEncoder {
         val env = OrtEnvironment.getEnvironment()
         val options = OrtSession.SessionOptions().apply {
           setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-          setIntraOpNumThreads(Runtime.getRuntime().availableProcessors().coerceIn(2, 4))
+          setIntraOpNumThreads(intraOpThreadCount)
         }
         val created = options.use { opts ->
           env.createSession(modelFile.absolutePath, opts)
@@ -172,7 +176,7 @@ class SlimSamVisionEncoder {
       throw CancellationException("SlimSamVisionEncoder is closing or closed")
     }
     val env = OrtEnvironment.getEnvironment()
-    val start = System.currentTimeMillis()
+    val startNs = SystemClock.elapsedRealtimeNanos()
     val shape = longArrayOf(1L, 3L, INPUT_SIZE.toLong(), INPUT_SIZE.toLong())
 
     try {
@@ -199,6 +203,14 @@ class SlimSamVisionEncoder {
 
             val embShape = embTensor.info.shape
             val posShape = posTensor.info.shape
+            val expectedOutputShape = longArrayOf(1L, 256L, 64L, 64L)
+            if (!embShape.contentEquals(expectedOutputShape) || !posShape.contentEquals(expectedOutputShape)) {
+              throw SlimSamRuntimeException(
+                SlimSamErrorCode.TENSOR_CONTRACT_MISMATCH,
+                "Encoder output shape mismatch: embeddings=${embShape.contentToString()}, " +
+                  "positional=${posShape.contentToString()}",
+              )
+            }
             val embeddings = FloatArray(SamImageEmbedding.ELEMENT_COUNT)
             val positional = FloatArray(SamImageEmbedding.ELEMENT_COUNT)
             embTensor.floatBuffer.get(embeddings)
@@ -207,12 +219,15 @@ class SlimSamVisionEncoder {
             verifyFinite(embeddings, OUTPUT_IMAGE_EMBEDDINGS)
             verifyFinite(positional, OUTPUT_POSITIONAL_EMBEDDINGS)
 
+            val endNs = SystemClock.elapsedRealtimeNanos().coerceAtLeast(startNs)
             SamImageEmbedding(
               imageEmbeddings = embeddings,
               imagePositionalEmbeddings = positional,
               embeddingsShape = embShape,
               positionalShape = posShape,
-              encoderDurationMs = (System.currentTimeMillis() - start).coerceAtLeast(0L),
+              encoderDurationMs = ((endNs - startNs) / 1_000_000L).coerceAtLeast(0L),
+              encoderStartNs = startNs,
+              encoderEndNs = endNs,
             )
           }
         }

@@ -59,6 +59,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -83,6 +84,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.R
+import com.example.BuildConfig
 import com.example.ui.theme.ChampagneGold
 import com.example.ui.theme.ChampagneGoldBright
 import com.example.ui.theme.CyanAura
@@ -98,6 +100,7 @@ import com.example.ui.theme.TextSecondary
 import com.yujian.fishmasklab.domain.ImageCoordinateMapper
 import com.yujian.fishmasklab.domain.PipelineState
 import com.yujian.fishmasklab.domain.RecognitionErrorReason
+import com.yujian.fishmasklab.runtime.RuntimeDiagnosticsStore
 import com.yujian.fishmasklab.renderer.FishContourGlowCanvas
 import com.yujian.fishmasklab.renderer.WaterOverlayEffect02Canvas
 import com.yujian.fishmasklab.renderer.rememberAnimationTimelineState
@@ -129,6 +132,12 @@ fun FishMaskHomeScreen(
     }
   }
 
+  val diagnosticExportLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.CreateDocument("application/zip"),
+  ) { uri ->
+    if (uri != null) viewModel.exportDiagnosticLogs(uri)
+  }
+
   val launchCameraFlow = {
     val hasPerm = ContextCompat.checkSelfPermission(
       context,
@@ -154,6 +163,18 @@ fun FishMaskHomeScreen(
       snackbarHostState.showSnackbar(deniedMsg)
       viewModel.dismissPermissionNotice()
     }
+  }
+
+  LaunchedEffect(viewModel) {
+    withFrameNanos { }
+    withFrameNanos { }
+    viewModel.onFirstFramePresented()
+  }
+
+  LaunchedEffect(uiState.diagnosticExportMessage) {
+    val message = uiState.diagnosticExportMessage ?: return@LaunchedEffect
+    snackbarHostState.showSnackbar(message)
+    viewModel.onDiagnosticExportMessageShown()
   }
 
   if (uiState.isCameraOpen) {
@@ -231,6 +252,18 @@ fun FishMaskHomeScreen(
         onRetrySelect = viewModel::openSourceSheet,
         onBackHome = viewModel::cancelAndResetToEmpty,
       )
+    }
+
+    if (BuildConfig.DEBUG) {
+      TextButton(
+        onClick = { diagnosticExportLauncher.launch(RuntimeDiagnosticsStore.defaultZipFileName()) },
+        modifier = Modifier
+          .align(Alignment.TopEnd)
+          .statusBarsPadding()
+          .padding(end = 12.dp, top = 4.dp),
+      ) {
+        Text("导出诊断 ZIP", color = ChampagneGold, fontSize = 11.sp)
+      }
     }
 
     SnackbarHost(

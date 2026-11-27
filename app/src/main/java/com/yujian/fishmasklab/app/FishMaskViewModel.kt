@@ -3,6 +3,7 @@ package com.yujian.fishmasklab.app
 import android.app.Application
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.yujian.fishmasklab.domain.ContourData
@@ -16,12 +17,16 @@ import com.yujian.fishmasklab.domain.PipelineState
 import com.yujian.fishmasklab.domain.RecognitionErrorReason
 import com.yujian.fishmasklab.runtime.PipelineProgressEvent
 import com.yujian.fishmasklab.runtime.RecognitionPipelineCoordinator
+import com.yujian.fishmasklab.runtime.RecognitionPerformanceRecorder
+import com.yujian.fishmasklab.runtime.RuntimeDiagnosticsStore
+import com.yujian.fishmasklab.runtime.RuntimeStageSpan
 import com.yujian.fishmasklab.runtime.RuntimeTelemetry
 import com.yujian.fishmasklab.runtime.ShutdownPhase
 import com.yujian.fishmasklab.runtime.SlimSamSegmenter
 import com.yujian.fishmasklab.runtime.YoloxFishDetector
 import java.io.File
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -50,6 +55,7 @@ data class FishMaskUiState(
   val cameraPermissionDenied: Boolean = false,
   val contourConfig: FrozenContourConfig = FrozenContourConfig(),
   val effect02Config: FrozenEffect02Config = FrozenEffect02Config(),
+  val diagnosticExportMessage: String? = null,
 ) {
   val isProcessing: Boolean
     get() = pipelineState == PipelineState.PHOTO_SELECTED ||
@@ -73,7 +79,14 @@ class FishMaskViewModel internal constructor(
   application: Application,
   internal val yoloxDetector: YoloxFishDetector,
   internal val slimSamSegmenter: SlimSamSegmenter,
-  internal val coordinator: RecognitionPipelineCoordinator = RecognitionPipelineCoordinator(yoloxDetector, slimSamSegmenter),
+  internal val coordinator: RecognitionPipelineCoordinator = RecognitionPipelineCoordinator(
+    yoloxDetector,
+    slimSamSegmenter,
+    performanceRecorder = RecognitionPerformanceRecorder(
+      application,
+      RuntimeDiagnosticsStore(application.applicationContext),
+    ),
+  ),
 ) : AndroidViewModel(application) {
 
   constructor(application: Application) : this(
@@ -88,6 +101,8 @@ class FishMaskViewModel internal constructor(
   private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private val pendingCleanupJobs = Collections.synchronizedList(mutableListOf<Job>())
   private val shutdownLock = Any()
+  private val firstFramePresented = AtomicBoolean(false)
+  private val processObservationNs = SystemClock.elapsedRealtimeNanos()
   private var shutdownJob: Job? = null
 
   private val photoGenerationCounter = AtomicLong(0L)
@@ -95,10 +110,22 @@ class FishMaskViewModel internal constructor(
   private var currentDetection: FishDetection? = null
   private var activeTaskId: Long = 0L
   private var loadJob: Job? = null
+  private var latestShaderFps: Float? = null
+
+  internal val performanceRecorder: RecognitionPerformanceRecorder?
+    get() = coordinator.performanceRecorder
+
+  private val diagnosticsStore: RuntimeDiagnosticsStore by lazy {
+    performanceRecorder?.store ?: RuntimeDiagnosticsStore(getApplication<Application>().applicationContext)
+  }
 
   init {
-    // Non-blocking background model warmup & asset audit
-    coordinator.warmupInBackground()
+    performanceRecorder?.recordWarmupStageDuration(
+      "APP_PROCESS_START",
+      processObservationNs,
+      processObservationNs,
+      metrics = mapOf("capturePoint" to "viewmodel_initialized"),
+    )
 
     viewModelScope.launch {
       coordinator.events.collect { event ->
@@ -121,6 +148,20 @@ class FishMaskViewModel internal constructor(
         }
       }
     }
+  }
+
+  /** Called after Compose has presented the first home frame. */
+  fun onFirstFramePresented() {
+    if (!firstFramePresented.compareAndSet(false, true)) return
+    val firstFrameNs = SystemClock.elapsedRealtimeNanos()
+    performanceRecorder?.recordWarmupStageDuration(
+      "FIRST_FRAME_PRESENTED",
+      processObservationNs,
+      firstFrameNs,
+      metrics = mapOf("durationBasis" to "from_viewmodel_initialization_observation"),
+    )
+    performanceRecorder?.captureResourceSample("first_frame_presented", 0L, 0L)
+    coordinator.warmupInBackground()
   }
 
   fun openSourceSheet() {
@@ -154,20 +195,30 @@ class FishMaskViewModel internal constructor(
   }
 
   fun onPhotoPicked(uri: Uri) {
-    loadAndRecognize { ExifPhotoLoader.loadFromUri(getApplication(), uri) }
+    val pickerReturnNs = SystemClock.elapsedRealtimeNanos()
+    loadAndRecognize(pickerReturnNs) {
+      ExifPhotoLoader.loadFromUri(getApplication(), uri, pickerReturnNs = pickerReturnNs)
+    }
   }
 
   fun onPhotoCaptured(file: File) {
     _uiState.update { it.copy(isCameraOpen = false) }
-    loadAndRecognize { ExifPhotoLoader.loadFromFileAndDeleteTemp(file) }
+    val captureReturnNs = SystemClock.elapsedRealtimeNanos()
+    loadAndRecognize(captureReturnNs) {
+      ExifPhotoLoader.loadFromFileAndDeleteTemp(file, captureReturnNs = captureReturnNs)
+    }
   }
 
   internal fun loadPhotoWithLoaderForTest(loader: suspend () -> LoadedFishPhoto) {
-    loadAndRecognize(loader)
+    loadAndRecognize(SystemClock.elapsedRealtimeNanos(), loader)
   }
 
-  private fun loadAndRecognize(loader: suspend () -> LoadedFishPhoto) {
+  private fun loadAndRecognize(
+    photoPickStartNs: Long,
+    loader: suspend () -> LoadedFishPhoto,
+  ) {
     if (coordinator.isShutdownRequested()) return
+    coordinator.recordAnimationCompletion(activeTaskId, latestShaderFps)
     val generationId = photoGenerationCounter.incrementAndGet()
     val prevJob = coordinator.cancelCurrentTask()
     val prevLoadJob = loadJob
@@ -230,6 +281,15 @@ class FishMaskViewModel internal constructor(
           mapper = loaded.mapper,
           tapPoint = null,
           existingDetection = null,
+          photoPickStartNs = photoPickStartNs,
+          photoLoadStageSpans = loaded.telemetry?.stages.orEmpty().map { stage ->
+            RuntimeStageSpan(
+              stageName = stage.stageName,
+              startNs = stage.startNs,
+              endNs = stage.endNs,
+              metrics = mapOf("durationMs" to stage.durationMs),
+            )
+          },
         )
         if (startedTaskId < 0L) {
           workBitmap = null
@@ -275,6 +335,7 @@ class FishMaskViewModel internal constructor(
     }
 
     val generationId = state.photoGenerationId
+    coordinator.recordAnimationCompletion(activeTaskId, latestShaderFps)
     val startedTaskId = coordinator.startRecognition(
       photoGenerationId = generationId,
       workBitmap = work,
@@ -311,6 +372,7 @@ class FishMaskViewModel internal constructor(
   }
 
   fun onTimelineInitialWindowCompleted() {
+    coordinator.recordAnimationCompletion(activeTaskId, latestShaderFps)
     _uiState.update { curr ->
       if (curr.pipelineState == PipelineState.PLAYING) {
         curr.copy(pipelineState = PipelineState.RESULT)
@@ -321,11 +383,38 @@ class FishMaskViewModel internal constructor(
   }
 
   fun onFpsSampled(fps: Float) {
+    latestShaderFps = fps
     RuntimeTelemetry.capture(taskId = activeTaskId, shaderFps = fps)
+  }
+
+  fun exportDiagnosticLogs(uri: Uri) {
+    viewModelScope.launch(Dispatchers.IO) {
+      val message = runCatching {
+        val output = getApplication<Application>().contentResolver.openOutputStream(uri, "w")
+          ?: error("系统文件选择器未能打开目标文件")
+        val result = output.use {
+          diagnosticsStore.exportDiagnosticZip(
+            outputStream = it,
+            currentWarmup = performanceRecorder?.currentWarmupRecord(),
+            auditReport = coordinator.auditReport.value,
+            resourceSamples = performanceRecorder?.resourceSamplesSnapshot().orEmpty(),
+          )
+        }
+        "诊断 ZIP 已导出：${result.fileCount} 个文件，${result.totalBytes} bytes，SHA-256 ${result.zipSha256}"
+      }.getOrElse { error ->
+        "诊断 ZIP 导出失败：${error.message ?: error.javaClass.simpleName}"
+      }
+      _uiState.update { it.copy(diagnosticExportMessage = message) }
+    }
+  }
+
+  fun onDiagnosticExportMessageShown() {
+    _uiState.update { it.copy(diagnosticExportMessage = null) }
   }
 
   fun cancelAndResetToEmpty() {
     photoGenerationCounter.incrementAndGet()
+    coordinator.recordAnimationCompletion(activeTaskId, latestShaderFps)
     val prevJob = coordinator.cancelCurrentTask()
     val prevLoadJob = loadJob
     prevLoadJob?.cancel()
@@ -372,6 +461,7 @@ class FishMaskViewModel internal constructor(
     synchronized(shutdownLock) {
       shutdownJob?.let { return it }
       photoGenerationCounter.incrementAndGet()
+      coordinator.recordAnimationCompletion(activeTaskId, latestShaderFps)
       coordinator.beginShutdown()
       val pendingLoadJob = loadJob
       pendingLoadJob?.cancel()

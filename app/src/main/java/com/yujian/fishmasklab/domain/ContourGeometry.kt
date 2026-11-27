@@ -438,7 +438,7 @@ object ContourGeometry {
     simplificationTolerance: Float = 2.2f,
     smoothingPasses: Int = 3,
     glintOverlay: GlintOverlayData? = null,
-    startTimeMs: Long = System.currentTimeMillis(),
+    startTimeNs: Long = System.nanoTime(),
   ): ContourData? {
     val lcc = getLargestConnectedComponent(mask, width, height)
     if (lcc.pixelCount < 60) return null
@@ -456,7 +456,7 @@ object ContourGeometry {
     if (finalSmoothed.size < 3) return null
 
     val (segments, totalLength) = pointsToCatmullRomBeziers(finalSmoothed)
-    val elapsed = (System.currentTimeMillis() - startTimeMs).coerceAtLeast(0L)
+    val elapsed = ((System.nanoTime() - startTimeNs) / 1_000_000L).coerceAtLeast(0L)
 
     return ContourData(
       rawPoints = rawPoints,

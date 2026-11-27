@@ -15,7 +15,22 @@ enum class ModelRuntimeStatus {
 enum class ModelLoadLifecycleState {
   NOT_STARTED,
   LOADING,
+  SESSION_READY,
+  SKIPPED_RESOURCE,
   READY,
+  ERROR,
+}
+
+/** Session creation and inference kernel warmup are reported as separate readiness states. */
+enum class RuntimeModuleState {
+  NOT_STARTED,
+  ASSET_VERIFYING,
+  PROCESSOR_READY,
+  SESSION_LOADING,
+  SESSION_READY,
+  KERNEL_WARMING,
+  INFERENCE_READY,
+  SKIPPED_RESOURCE,
   ERROR,
 }
 

@@ -1,9 +1,9 @@
 package com.yujian.fishmasklab.runtime
 
 import android.graphics.Bitmap
+import android.os.SystemClock
 import com.yujian.fishmasklab.domain.ImageCoordinateMapper
 import kotlin.math.floor
-import kotlin.math.max
 import kotlin.math.min
 import org.json.JSONObject
 
@@ -14,10 +14,12 @@ data class SamPreprocessorConfig(
   val rescaleFactor: Float = 1.0f / 255.0f,
   val imageMean: FloatArray = floatArrayOf(0.485f, 0.456f, 0.406f),
   val imageStd: FloatArray = floatArrayOf(0.229f, 0.224f, 0.225f),
+  val resample: Int = 2,
   val doResize: Boolean = true,
   val doRescale: Boolean = true,
   val doNormalize: Boolean = true,
   val doPad: Boolean = true,
+  val doConvertRgb: Boolean = true,
 ) {
   companion object {
     fun fromJson(json: String): SamPreprocessorConfig {
@@ -51,12 +53,33 @@ data class SamPreprocessorConfig(
         rescaleFactor = root.optDouble("rescale_factor", 1.0 / 255.0).toFloat(),
         imageMean = mean,
         imageStd = std,
+        resample = root.optInt("resample", 2),
         doResize = root.optBoolean("do_resize", true),
         doRescale = root.optBoolean("do_rescale", true),
         doNormalize = root.optBoolean("do_normalize", true),
         doPad = root.optBoolean("do_pad", true),
+        doConvertRgb = root.optBoolean("do_convert_rgb", true),
       )
     }
+  }
+
+  fun validateSlimSam77Contract() {
+    require(longestEdge == 1024 && padWidth == 1024 && padHeight == 1024) {
+      "SlimSAM-77 requires longestEdge=1024 and 1024x1024 padding"
+    }
+    require(doConvertRgb && doResize && doRescale && doNormalize && doPad) {
+      "SlimSAM-77 processor must use RGB conversion, resize, rescale, normalize, and pad"
+    }
+    require(resample == 2) { "SlimSAM-77 processor requires bilinear resampling (resample=2)" }
+    require(kotlin.math.abs(rescaleFactor - (1f / 255f)) <= 1e-8f) {
+      "SlimSAM-77 rescaleFactor must equal 1/255"
+    }
+    val expectedMean = floatArrayOf(0.485f, 0.456f, 0.406f)
+    val expectedStd = floatArrayOf(0.229f, 0.224f, 0.225f)
+    require(imageMean.size == 3 && imageStd.size == 3 &&
+      imageMean.indices.all { kotlin.math.abs(imageMean[it] - expectedMean[it]) <= 1e-6f } &&
+      imageStd.indices.all { kotlin.math.abs(imageStd[it] - expectedStd[it]) <= 1e-6f }
+    ) { "SlimSAM-77 processor must use frozen ImageNet RGB mean/std values" }
   }
 }
 
@@ -71,7 +94,40 @@ data class SamPreprocessedImage(
   val padRight: Int,
   val padBottom: Int,
   val preprocessDurationMs: Long,
+  val preprocessStartNs: Long = 0L,
+  val preprocessEndNs: Long = 0L,
 )
+
+/** Dimensions and timing retained for prompt mapping after the large encoder input is released. */
+data class SamPreprocessedMetadata(
+  val originalWidth: Int,
+  val originalHeight: Int,
+  val resizedWidth: Int,
+  val resizedHeight: Int,
+  val padWidth: Int,
+  val padHeight: Int,
+  val padRight: Int,
+  val padBottom: Int,
+  val preprocessDurationMs: Long,
+  val preprocessStartNs: Long,
+  val preprocessEndNs: Long,
+) {
+  companion object {
+    fun from(image: SamPreprocessedImage) = SamPreprocessedMetadata(
+      originalWidth = image.originalWidth,
+      originalHeight = image.originalHeight,
+      resizedWidth = image.resizedWidth,
+      resizedHeight = image.resizedHeight,
+      padWidth = image.padWidth,
+      padHeight = image.padHeight,
+      padRight = image.padRight,
+      padBottom = image.padBottom,
+      preprocessDurationMs = image.preprocessDurationMs,
+      preprocessStartNs = image.preprocessStartNs,
+      preprocessEndNs = image.preprocessEndNs,
+    )
+  }
+}
 
 /**
  * Full parity port of HuggingFace `SamImageProcessor` (`preprocessor_config.json`):
@@ -85,13 +141,35 @@ class SlimSamImageProcessor(
   val config: SamPreprocessorConfig = SamPreprocessorConfig(),
 ) {
 
+  private companion object {
+    const val MAX_RETAINED_BITMAP_PIXELS = 1_048_576
+  }
+
+  private val bitmapPixelBufferLock = Any()
+  private var bitmapPixelBuffer = IntArray(0)
+
   fun preprocess(bitmap: Bitmap): SamPreprocessedImage {
     check(!bitmap.isRecycled) { "Cannot preprocess recycled Bitmap" }
     val w = bitmap.width
     val h = bitmap.height
-    val pixels = IntArray(w * h)
-    bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
-    return preprocessArgb(pixels, w, h)
+    return synchronized(bitmapPixelBufferLock) {
+      val requiredSize = Math.multiplyExact(w, h)
+      if (bitmapPixelBuffer.size < requiredSize) {
+        bitmapPixelBuffer = IntArray(requiredSize)
+      }
+      val pixels = bitmapPixelBuffer
+      bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+      try {
+        preprocessArgb(pixels, w, h)
+      } finally {
+        // The reusable buffer must not retain a previous photo after its Tensor has been built.
+        pixels.fill(0, 0, requiredSize)
+        // Avoid pinning tens of MiB after a full-resolution camera/gallery image.
+        if (requiredSize > MAX_RETAINED_BITMAP_PIXELS) {
+          bitmapPixelBuffer = IntArray(0)
+        }
+      }
+    }
   }
 
   fun preprocessArgb(argbPixels: IntArray, originalWidth: Int, originalHeight: Int): SamPreprocessedImage {
@@ -102,7 +180,7 @@ class SlimSamImageProcessor(
       "Pixel buffer size ${argbPixels.size} smaller than ${originalWidth * originalHeight}"
     }
 
-    val start = System.currentTimeMillis()
+    val startNs = SystemClock.elapsedRealtimeNanos()
     val (resizedW, resizedH) = if (config.doResize) {
       ImageCoordinateMapper.computeSamResizedDims(originalWidth, originalHeight, config.longestEdge)
     } else {
@@ -196,6 +274,7 @@ class SlimSamImageProcessor(
       }
     }
 
+    val endNs = SystemClock.elapsedRealtimeNanos().coerceAtLeast(startNs)
     return SamPreprocessedImage(
       pixelValues = tensorData,
       originalWidth = originalWidth,
@@ -206,7 +285,9 @@ class SlimSamImageProcessor(
       padHeight = padH,
       padRight = (padW - resizedW).coerceAtLeast(0),
       padBottom = (padH - resizedH).coerceAtLeast(0),
-      preprocessDurationMs = (System.currentTimeMillis() - start).coerceAtLeast(0L),
+      preprocessDurationMs = ((endNs - startNs) / 1_000_000L).coerceAtLeast(0L),
+      preprocessStartNs = startNs,
+      preprocessEndNs = endNs,
     )
   }
 }

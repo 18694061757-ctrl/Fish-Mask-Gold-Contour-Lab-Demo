@@ -125,6 +125,7 @@ class RuntimeDiagnosticsStore(
                   put("createdAtUtc", s.createdAtUtc)
                   put("durationMs", s.durationMs)
                   put("status", s.status.name)
+                  put("modelVersions", JSONObject(s.modelVersions))
                   if (s.errorCode != null) put("errorCode", s.errorCode)
                   if (s.warmupSnapshot != null) put("warmupSnapshot", s.warmupSnapshot.toJson())
                   if (s.summaryMetrics != null) put("summaryMetrics", s.summaryMetrics.toJson())
@@ -414,6 +415,7 @@ class RuntimeDiagnosticsStore(
     outputStream: OutputStream,
     currentWarmup: GlobalWarmupRecord? = null,
     auditReport: ModelAssetAuditReport? = null,
+    resourceSamples: List<RuntimeResourceSample> = emptyList(),
   ): DiagnosticZipExportResult = withContext(Dispatchers.IO) {
     flushPendingWrites()
     val warmup: GlobalWarmupRecord?
@@ -444,10 +446,107 @@ class RuntimeDiagnosticsStore(
       "model_manifest.json" to bundle.modelManifestJson.toByteArray(Charsets.UTF_8),
     )
 
+    val startupStages = warmup?.stages.orEmpty()
+    val recognitionStages = sessions.flatMap { session -> session.stages.map { session to it } }
+    val startupTimeline = JSONObject().apply {
+      put("status", if (startupStages.isEmpty()) "NOT_CAPTURED" else "CAPTURED")
+      put("timeUnit", "ms")
+      put("stages", JSONArray().apply { startupStages.forEach { put(it.toJson()) } })
+    }
+    val recognitionTimeline = JSONObject().apply {
+      put("status", if (sessions.isEmpty()) "NOT_CAPTURED" else "CAPTURED")
+      put("timeUnit", "ms")
+      put("sessions", JSONArray().apply { sessions.forEach { put(it.toJson()) } })
+    }
+    val runtimeStatus = JSONObject().apply {
+      put("status", warmup?.status?.name ?: ModelLoadLifecycleState.NOT_STARTED.name)
+      put("allModulesInferenceReady", warmup?.allModulesInferenceReady ?: false)
+      put("moduleStates", JSONObject().apply {
+        warmup?.moduleStates?.forEach { (module, state) -> put(module, state.name) }
+      })
+      if (warmup == null) put("captureStatus", "NOT_CAPTURED")
+    }
+    val onnxStages = startupStages.filter { stage ->
+      stage.stageName.contains("session", ignoreCase = true) ||
+        stage.stageName.contains("warmup", ignoreCase = true) ||
+        stage.stageName.contains("ort_env", ignoreCase = true)
+    } + recognitionStages.map { it.second }.filter { stage ->
+      stage.stageName.contains("yolox_inference", ignoreCase = true) ||
+        stage.stageName.contains("encoder", ignoreCase = true) ||
+        stage.stageName.contains("decoder", ignoreCase = true)
+    }
+    val onnxSessionMetrics = JSONObject().apply {
+      put("status", if (onnxStages.isEmpty()) "NOT_CAPTURED" else "CAPTURED")
+      put("timeUnit", "ms")
+      put("stages", JSONArray().apply { onnxStages.forEach { put(it.toJson()) } })
+    }
+    val preprocessStages = recognitionStages.map { it.second }.filter { stage ->
+      stage.stageName.contains("preprocess", ignoreCase = true) ||
+        stage.stageName.startsWith("photo_") || stage.stageName == "exif_normalize"
+    }
+    val preprocessMetrics = JSONObject().apply {
+      put("status", if (preprocessStages.isEmpty()) "NOT_CAPTURED" else "CAPTURED")
+      put("timeUnit", "ms")
+      put("stages", JSONArray().apply { preprocessStages.forEach { put(it.toJson()) } })
+    }
+    val memoryProfile = JSONObject().apply {
+      put("status", if (resourceSamples.isEmpty()) "NOT_CAPTURED" else "CAPTURED_POINT_SAMPLES")
+      put("sampleCount", resourceSamples.size)
+      if (resourceSamples.isNotEmpty()) {
+        put("observedSampledPssPeakKb", resourceSamples.maxOf { it.pssTotalKb })
+        put("observedSampledNativeHeapPeakKb", resourceSamples.maxOf { it.nativeHeapAllocatedKb })
+        put("samples", JSONArray().apply { resourceSamples.forEach { put(it.toJson()) } })
+      }
+      put("encoderInputTensorRetainedAfterEncoder", false)
+      put("encoderInputTensorReleaseSemantics", "No photo-cache reference after Encoder call returns; heap reclamation remains GC-managed")
+      put("peakDefinition", "Maximum among explicit runtime samples; this is not a continuous device-wide peak")
+    }
+    val gcSamples = resourceSamples.filter { it.gcCollectionCount >= 0L && it.gcCollectionTimeMs >= 0L }
+    val gcMetrics = JSONObject().apply {
+      put("status", if (gcSamples.isEmpty()) "NOT_CAPTURED" else "CAPTURED_POINT_SAMPLES")
+      put("counterSource", "Debug.getRuntimeStat(art.gc.gc-count/art.gc.gc-time)")
+      put("samples", JSONArray().apply { gcSamples.forEach { put(it.toJson()) } })
+      if (gcSamples.size >= 2) {
+        put("observedCollectionCountDelta", (gcSamples.last().gcCollectionCount - gcSamples.first().gcCollectionCount).coerceAtLeast(0L))
+        put("observedCollectionTimeMsDelta", (gcSamples.last().gcCollectionTimeMs - gcSamples.first().gcCollectionTimeMs).coerceAtLeast(0L))
+      }
+    }
+    val threadConfig = JSONObject().apply {
+      val threadStages = startupStages.filter { it.metrics.containsKey("intraOpThreads") }
+      put("status", if (threadStages.isEmpty()) "NOT_CAPTURED" else "CAPTURED_CURRENT_CONFIGURATION")
+      put("cpuThreadMatrixStatus", "DEVICE_THREAD_MATRIX_NOT_RUN")
+      put("nnapiComparisonStatus", "NOT_RUN_CPU_DEFAULT_RETAINED")
+      put("slimSamEncoderDecoderConcurrencyStatus", "SEQUENTIAL_NO_DEVICE_REPEAT_EVIDENCE")
+      put("intraOpConfigurations", JSONArray().apply {
+        threadStages.forEach { stage ->
+          put(JSONObject().apply {
+            put("stageName", stage.stageName)
+            put("intraOpThreads", stage.metrics["intraOpThreads"])
+          })
+        }
+      })
+    }
+    val externalTests = JSONObject().apply {
+      put("status", "NOT_CAPTURED_IN_RUNTIME")
+      put("detail", "Parity and unit test results are produced by CI test artifacts, not by the app runtime export")
+    }
+    entries["startup_timeline.json"] = startupTimeline.toString(2).toByteArray(Charsets.UTF_8)
+    entries["recognition_timeline.json"] = recognitionTimeline.toString(2).toByteArray(Charsets.UTF_8)
+    entries["model_runtime_status.json"] = runtimeStatus.toString(2).toByteArray(Charsets.UTF_8)
+    entries["onnx_session_metrics.json"] = onnxSessionMetrics.toString(2).toByteArray(Charsets.UTF_8)
+    entries["preprocess_metrics.json"] = preprocessMetrics.toString(2).toByteArray(Charsets.UTF_8)
+    entries["memory_profile.json"] = memoryProfile.toString(2).toByteArray(Charsets.UTF_8)
+    entries["gc_metrics.json"] = gcMetrics.toString(2).toByteArray(Charsets.UTF_8)
+    entries["thread_config.json"] = threadConfig.toString(2).toByteArray(Charsets.UTF_8)
+    entries["model_asset_manifest.json"] = bundle.modelManifestJson.toByteArray(Charsets.UTF_8)
+    entries["parity_test_results.json"] = externalTests.toString(2).toByteArray(Charsets.UTF_8)
+    entries["test_summary.json"] = externalTests.toString(2).toByteArray(Charsets.UTF_8)
+
     val sumsSb = StringBuilder()
     for ((name, bytes) in entries) {
       sumsSb.append(sha256Hex(bytes)).append("  ").append(name).append('\n')
     }
+    entries["SHA256SUMS"] = sumsSb.toString().toByteArray(Charsets.UTF_8)
     entries["SHA256SUMS.txt"] = sumsSb.toString().toByteArray(Charsets.UTF_8)
 
     val baos = ByteArrayOutputStream()

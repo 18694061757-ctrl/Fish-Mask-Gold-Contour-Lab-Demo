@@ -12,6 +12,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToLong
@@ -39,6 +40,8 @@ data class DeviceEnvironmentInfo(
   val pssTotalKb: Long,
   val availableMemoryKb: Long,
   val totalMemoryKb: Long,
+  val gcCollectionCount: Long,
+  val gcCollectionTimeMs: Long,
   val onnxRuntimeVersion: String,
   val executionProvider: String,
 ) {
@@ -57,6 +60,8 @@ data class DeviceEnvironmentInfo(
     put("pssTotalKb", pssTotalKb)
     put("availableMemoryKb", availableMemoryKb)
     put("totalMemoryKb", totalMemoryKb)
+    put("gcCollectionCount", gcCollectionCount)
+    put("gcCollectionTimeMs", gcCollectionTimeMs)
     put("onnxRuntimeVersion", onnxRuntimeVersion)
     put("executionProvider", executionProvider)
   }
@@ -119,6 +124,8 @@ data class DeviceEnvironmentInfo(
       val manufacturer = runCatching { Build.MANUFACTURER.orEmpty().ifBlank { "unknown" } }.getOrDefault("unknown")
       val model = runCatching { Build.MODEL.orEmpty().ifBlank { "unknown" } }.getOrDefault("unknown")
       val abis = runCatching { Build.SUPPORTED_ABIS?.toList().orEmpty() }.getOrDefault(emptyList())
+      val gcCount = runCatching { Debug.getRuntimeStat("art.gc.gc-count")?.toLongOrNull() ?: -1L }.getOrDefault(-1L)
+      val gcTimeMs = runCatching { Debug.getRuntimeStat("art.gc.gc-time")?.toLongOrNull() ?: -1L }.getOrDefault(-1L)
 
       return DeviceEnvironmentInfo(
         appVersionName = versionName,
@@ -135,6 +142,8 @@ data class DeviceEnvironmentInfo(
         pssTotalKb = pssKb,
         availableMemoryKb = availMemKb,
         totalMemoryKb = totalMemKb,
+        gcCollectionCount = gcCount,
+        gcCollectionTimeMs = gcTimeMs,
         onnxRuntimeVersion = ortVersion,
         executionProvider = executionProvider,
       )
@@ -164,6 +173,8 @@ data class DeviceEnvironmentInfo(
         pssTotalKb = json.optLong("pssTotalKb", 0L),
         availableMemoryKb = json.optLong("availableMemoryKb", 0L),
         totalMemoryKb = json.optLong("totalMemoryKb", 0L),
+        gcCollectionCount = json.optLong("gcCollectionCount", -1L),
+        gcCollectionTimeMs = json.optLong("gcCollectionTimeMs", -1L),
         onnxRuntimeVersion = json.optString("onnxRuntimeVersion", "unknown"),
         executionProvider = json.optString("executionProvider", "CPU"),
       )
@@ -243,6 +254,7 @@ data class WarmupTimingSnapshot(
   val warmupTotalMs: Double?,
   val slimSamTotalLoadMs: Double?,
   val yoloxTotalLoadMs: Double?,
+  val moduleStatesAtPick: Map<String, RuntimeModuleState> = emptyMap(),
 ) {
   fun toJson(): JSONObject = JSONObject().apply {
     put("yoloxStateAtPick", yoloxStateAtPick.name)
@@ -252,6 +264,9 @@ data class WarmupTimingSnapshot(
     put("modelWaitTimeMs", modelWaitTimeMs)
     put("modelWaitParallelWithPhotoLoad", modelWaitParallelWithPhotoLoad)
     put("warmupOverlapWithPhotoLoadMs", warmupOverlapWithPhotoLoadMs)
+    put("moduleStatesAtPick", JSONObject().apply {
+      moduleStatesAtPick.forEach { (module, state) -> put(module, state.name) }
+    })
     if (warmupTotalMs != null) put("warmupTotalMs", warmupTotalMs)
     if (slimSamTotalLoadMs != null) put("slimSamTotalLoadMs", slimSamTotalLoadMs)
     if (yoloxTotalLoadMs != null) put("yoloxTotalLoadMs", yoloxTotalLoadMs)
@@ -282,6 +297,7 @@ data class WarmupTimingSnapshot(
         warmupTotalMs = if (json.has("warmupTotalMs")) json.optDouble("warmupTotalMs") else null,
         slimSamTotalLoadMs = if (json.has("slimSamTotalLoadMs")) json.optDouble("slimSamTotalLoadMs") else null,
         yoloxTotalLoadMs = if (json.has("yoloxTotalLoadMs")) json.optDouble("yoloxTotalLoadMs") else null,
+        moduleStatesAtPick = json.optJSONObject("moduleStatesAtPick")?.let(::parseRuntimeModuleStates).orEmpty(),
       )
     }
   }
@@ -360,6 +376,7 @@ data class PerformanceSessionRecord(
   val status: StageOutcome,
   val errorCode: String? = null,
   val deviceInfo: DeviceEnvironmentInfo,
+  val modelVersions: Map<String, String> = emptyMap(),
   val warmupSnapshot: WarmupTimingSnapshot? = null,
   val summaryMetrics: RecognitionSummaryMetrics? = null,
   val stages: List<StageTimingRecord> = emptyList(),
@@ -378,6 +395,7 @@ data class PerformanceSessionRecord(
     put("status", status.name)
     if (errorCode != null) put("errorCode", errorCode)
     put("deviceInfo", deviceInfo.toJson())
+    put("modelVersions", JSONObject(modelVersions))
     if (warmupSnapshot != null) put("warmupSnapshot", warmupSnapshot.toJson())
     if (summaryMetrics != null) put("summaryMetrics", summaryMetrics.toJson())
     put("stages", JSONArray().apply { stages.forEach { put(it.toJson()) } })
@@ -409,11 +427,49 @@ data class PerformanceSessionRecord(
         errorCode = json.optString("errorCode").takeIf { it.isNotEmpty() },
         deviceInfo = json.optJSONObject("deviceInfo")?.let { DeviceEnvironmentInfo.fromJson(it) }
           ?: DeviceEnvironmentInfo.capture(null),
+        modelVersions = json.optJSONObject("modelVersions")?.let(::parseStringMap).orEmpty(),
         warmupSnapshot = json.optJSONObject("warmupSnapshot")?.let { WarmupTimingSnapshot.fromJson(it) },
         summaryMetrics = json.optJSONObject("summaryMetrics")?.let { RecognitionSummaryMetrics.fromJson(it) },
         stages = stageList,
       )
     }
+  }
+}
+
+private fun parseStringMap(json: JSONObject): Map<String, String> = buildMap {
+  val keys = json.keys()
+  while (keys.hasNext()) {
+    val key = keys.next()
+    val value = json.optString(key)
+    if (value.isNotBlank()) put(key, value)
+  }
+}
+
+data class RuntimeResourceSample(
+  val phase: String,
+  val timestampNs: Long,
+  val taskId: Long,
+  val photoGenerationId: Long,
+  val javaHeapUsedKb: Long,
+  val javaHeapMaxKb: Long,
+  val nativeHeapAllocatedKb: Long,
+  val pssTotalKb: Long,
+  val availableMemoryKb: Long,
+  val gcCollectionCount: Long,
+  val gcCollectionTimeMs: Long,
+) {
+  fun toJson(): JSONObject = JSONObject().apply {
+    put("phase", phase)
+    put("timestampNs", timestampNs)
+    put("taskId", taskId)
+    put("photoGenerationId", photoGenerationId)
+    put("javaHeapUsedKb", javaHeapUsedKb)
+    put("javaHeapMaxKb", javaHeapMaxKb)
+    put("nativeHeapAllocatedKb", nativeHeapAllocatedKb)
+    put("pssTotalKb", pssTotalKb)
+    put("availableMemoryKb", availableMemoryKb)
+    put("gcCollectionCount", gcCollectionCount)
+    put("gcCollectionTimeMs", gcCollectionTimeMs)
   }
 }
 
@@ -433,7 +489,14 @@ data class GlobalWarmupRecord(
   val errorCode: String? = null,
   val deviceInfo: DeviceEnvironmentInfo? = null,
   val stages: List<StageTimingRecord> = emptyList(),
+  val moduleStates: Map<String, RuntimeModuleState> = emptyMap(),
 ) {
+  val allModulesInferenceReady: Boolean
+    get() = moduleStates["YOLOX"] == RuntimeModuleState.INFERENCE_READY &&
+      moduleStates["PROCESSOR"] == RuntimeModuleState.PROCESSOR_READY &&
+      moduleStates["ENCODER"] == RuntimeModuleState.INFERENCE_READY &&
+      moduleStates["DECODER"] == RuntimeModuleState.INFERENCE_READY
+
   fun toJson(): JSONObject = JSONObject().apply {
     put("status", status.name)
     put("slimSamState", slimSamState.name)
@@ -450,6 +513,9 @@ data class GlobalWarmupRecord(
     if (errorCode != null) put("errorCode", errorCode)
     if (deviceInfo != null) put("deviceInfo", deviceInfo.toJson())
     put("stages", JSONArray().apply { stages.forEach { put(it.toJson()) } })
+    put("moduleStates", JSONObject().apply {
+      moduleStates.forEach { (module, state) -> put(module, state.name) }
+    })
   }
 
   companion object {
@@ -481,8 +547,18 @@ data class GlobalWarmupRecord(
         errorCode = json.optString("errorCode").takeIf { it.isNotEmpty() },
         deviceInfo = json.optJSONObject("deviceInfo")?.let { DeviceEnvironmentInfo.fromJson(it) },
         stages = stageList,
+        moduleStates = json.optJSONObject("moduleStates")?.let(::parseRuntimeModuleStates).orEmpty(),
       )
     }
+  }
+}
+
+private fun parseRuntimeModuleStates(json: JSONObject): Map<String, RuntimeModuleState> = buildMap {
+  val keys = json.keys()
+  while (keys.hasNext()) {
+    val key = keys.next()
+    val state = runCatching { RuntimeModuleState.valueOf(json.optString(key)) }.getOrNull()
+    if (state != null) put(key, state)
   }
 }
 
@@ -547,11 +623,13 @@ object DiagnosticPrivacySanitizer {
  */
 class RecognitionPerformanceRecorder(
   private val context: Context? = null,
-  private val store: RuntimeDiagnosticsStore? = null,
+  internal val store: RuntimeDiagnosticsStore? = null,
   private val nanoClock: () -> Long = { SystemClock.elapsedRealtimeNanos() },
   private val utcClockMs: () -> Long = { System.currentTimeMillis() },
 ) {
   companion object {
+    private const val MAX_RESOURCE_SAMPLES = 500
+
     fun nanosToMs(deltaNanos: Long): Double = deltaNanos.coerceAtLeast(0L) / 1_000_000.0
   }
 
@@ -568,6 +646,7 @@ class RecognitionPerformanceRecorder(
     val createdAtUtc: String,
     val startTimestampNs: Long,
     val deviceInfo: DeviceEnvironmentInfo,
+    val modelVersions: Map<String, String>,
   ) {
     val lock = Any()
     val openStages = LinkedHashMap<String, Pair<Long, Map<String, Any>>>()
@@ -580,6 +659,7 @@ class RecognitionPerformanceRecorder(
   }
 
   private val sessions = ConcurrentHashMap<String, MutableSession>()
+  private val resourceSamples = CopyOnWriteArrayList<RuntimeResourceSample>()
   private val warmupLock = Any()
   private var warmupStatus: ModelLoadLifecycleState = ModelLoadLifecycleState.NOT_STARTED
   private var slimSamLoadState: ModelLoadLifecycleState = ModelLoadLifecycleState.NOT_STARTED
@@ -595,6 +675,7 @@ class RecognitionPerformanceRecorder(
   private var warmupErrorCode: String? = null
   private val warmupOpenStages = LinkedHashMap<String, Long>()
   private val warmupCompletedStages = LinkedHashMap<String, StageTimingRecord>()
+  private val moduleStates = LinkedHashMap<String, RuntimeModuleState>()
   private var executionProvider: String = "CPU"
 
   @Volatile
@@ -602,6 +683,32 @@ class RecognitionPerformanceRecorder(
     private set
 
   fun nowNanos(): Long = nanoClock()
+
+  fun captureResourceSample(
+    phase: String,
+    taskId: Long,
+    photoGenerationId: Long,
+  ): RuntimeResourceSample {
+    val device = DeviceEnvironmentInfo.capture(context, executionProvider)
+    val sample = RuntimeResourceSample(
+      phase = DiagnosticPrivacySanitizer.sanitizeText(phase),
+      timestampNs = nanoClock(),
+      taskId = taskId,
+      photoGenerationId = photoGenerationId,
+      javaHeapUsedKb = device.javaHeapUsedKb,
+      javaHeapMaxKb = device.javaHeapMaxKb,
+      nativeHeapAllocatedKb = device.nativeHeapAllocatedKb,
+      pssTotalKb = device.pssTotalKb,
+      availableMemoryKb = device.availableMemoryKb,
+      gcCollectionCount = device.gcCollectionCount,
+      gcCollectionTimeMs = device.gcCollectionTimeMs,
+    )
+    resourceSamples.add(sample)
+    while (resourceSamples.size > MAX_RESOURCE_SAMPLES) resourceSamples.removeAt(0)
+    return sample
+  }
+
+  fun resourceSamplesSnapshot(): List<RuntimeResourceSample> = resourceSamples.toList()
 
   fun updateExecutionProvider(provider: String) {
     executionProvider = DiagnosticPrivacySanitizer.sanitizeText(provider).ifBlank { "CPU" }
@@ -619,6 +726,26 @@ class RecognitionPerformanceRecorder(
   fun incrementDuplicateEnsureLoadedGuard() {
     synchronized(warmupLock) {
       warmupDuplicateGuardCount++
+    }
+  }
+
+  fun updateModuleState(
+    moduleName: String,
+    state: RuntimeModuleState,
+    errorCode: String? = null,
+  ) {
+    val snapshotToPersist: GlobalWarmupRecord?
+    synchronized(warmupLock) {
+      val now = nanoClock()
+      if (warmupStartNs == 0L) warmupStartNs = now
+      moduleStates[moduleName] = state
+      if (state == RuntimeModuleState.ERROR) {
+        warmupErrorCode = errorCode ?: "${moduleName}_ERROR"
+      }
+      snapshotToPersist = refreshGlobalWarmupLocked(now)
+    }
+    if (snapshotToPersist != null) {
+      store?.persistWarmupAsync(snapshotToPersist)
     }
   }
 
@@ -673,6 +800,30 @@ class RecognitionPerformanceRecorder(
   }
 
   private fun refreshGlobalWarmupLocked(nowNs: Long): GlobalWarmupRecord? {
+    if (moduleStates.isNotEmpty()) {
+      val ready = moduleStates["YOLOX"] == RuntimeModuleState.INFERENCE_READY &&
+        moduleStates["PROCESSOR"] == RuntimeModuleState.PROCESSOR_READY &&
+        moduleStates["ENCODER"] == RuntimeModuleState.INFERENCE_READY &&
+        moduleStates["DECODER"] == RuntimeModuleState.INFERENCE_READY
+      if (ready) {
+        warmupStatus = ModelLoadLifecycleState.READY
+        if (allModelsReadyNs == null) allModelsReadyNs = nowNs.coerceAtLeast(warmupStartNs)
+        return buildWarmupRecordLocked()
+      }
+      if (moduleStates.values.any { it == RuntimeModuleState.ERROR }) {
+        warmupStatus = ModelLoadLifecycleState.ERROR
+        return buildWarmupRecordLocked()
+      }
+      if (moduleStates.values.any { it == RuntimeModuleState.SKIPPED_RESOURCE }) {
+        warmupStatus = ModelLoadLifecycleState.SKIPPED_RESOURCE
+        return buildWarmupRecordLocked()
+      }
+      if (warmupStatus == ModelLoadLifecycleState.NOT_STARTED) {
+        warmupStatus = ModelLoadLifecycleState.LOADING
+      }
+      return null
+    }
+
     if (slimSamLoadState == ModelLoadLifecycleState.READY && yoloxLoadState == ModelLoadLifecycleState.READY) {
       warmupStatus = ModelLoadLifecycleState.READY
       if (allModelsReadyNs == null) {
@@ -782,11 +933,15 @@ class RecognitionPerformanceRecorder(
       errorCode = warmupErrorCode,
       deviceInfo = DeviceEnvironmentInfo.capture(context, executionProvider),
       stages = warmupCompletedStages.values.toList(),
+      moduleStates = moduleStates.toMap(),
     )
   }
 
   fun captureWarmupPickState(): Pair<ModelLoadLifecycleState, ModelLoadLifecycleState> =
     synchronized(warmupLock) { yoloxLoadState to slimSamLoadState }
+
+  fun captureModuleStates(): Map<String, RuntimeModuleState> =
+    synchronized(warmupLock) { moduleStates.toMap() }
 
   fun startSession(
     taskId: Long,
@@ -794,6 +949,10 @@ class RecognitionPerformanceRecorder(
     mode: String,
     startProfile: String,
     startTimestampNs: Long = nanoClock(),
+    modelVersions: Map<String, String> = mapOf(
+      "YOLOX" to ModelAssetAudit.YOLOX_EXPECTED_SHA256,
+      "SlimSAM" to ModelAssetAudit.SLIMSAM_REVISION,
+    ),
   ): String {
     val runIdx = runCounter.incrementAndGet()
     val seq = sessionCounter.incrementAndGet()
@@ -811,6 +970,7 @@ class RecognitionPerformanceRecorder(
       createdAtUtc = fmt.format(Date(utcClockMs())),
       startTimestampNs = startTimestampNs,
       deviceInfo = DeviceEnvironmentInfo.capture(context, executionProvider),
+      modelVersions = modelVersions,
     )
     sessions[sessionId] = session
     return sessionId
@@ -1058,6 +1218,7 @@ class RecognitionPerformanceRecorder(
       status = s.finishedOutcome ?: StageOutcome.SUCCESS,
       errorCode = s.errorCode,
       deviceInfo = s.deviceInfo,
+      modelVersions = s.modelVersions,
       warmupSnapshot = s.warmupSnapshot,
       summaryMetrics = s.summaryMetrics,
       stages = s.completedStages.values.toList(),

@@ -4,11 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-EVIDENCE_SRC="${EVIDENCE_SRC:-$ROOT_DIR/app/build/evidence/p0_v2_1}"
+EVIDENCE_SRC="${EVIDENCE_SRC:-$ROOT_DIR/app/build/evidence/p0_v2_2}"
 JUNIT_SRC="${JUNIT_SRC:-$ROOT_DIR/app/build/test-results/testDebugUnitTest}"
 APK_PATH="${APK_PATH:-$ROOT_DIR/app/build/outputs/apk/debug/app-debug.apk}"
 VERIFY_DIR="${VERIFY_DIR:-$ROOT_DIR/app/build/ci-verify}"
-OUT_ZIP="${OUT_ZIP:-$ROOT_DIR/FISH_MASK_ANDROID_P0_V2_1_EVIDENCE.zip}"
+OUT_ZIP="${OUT_ZIP:-$ROOT_DIR/FISH_MASK_ANDROID_P0_V2_2_EVIDENCE.zip}"
 
 VERIFIED_SOURCE_HEAD="${VERIFIED_SOURCE_HEAD:-$(git rev-parse HEAD 2>/dev/null || echo 'UNCOMMITTED_WORKSPACE')}"
 STAGING_DIR="$(mktemp -d)"
@@ -124,10 +124,10 @@ ENC_SHA=$(unzip -p "$APK_PATH" "assets/models/slimsam/onnx/vision_encoder_quanti
 DEC_SHA=$(unzip -p "$APK_PATH" "assets/models/slimsam/onnx/prompt_encoder_mask_decoder_quantized.onnx" | sha256sum | awk '{print $1}')
 
 cat > "$VERIFY_DIR/build-metadata.txt" <<EOF
-task_id=FISH_MASK_ANDROID_P0_V2_1_CI_NATIVE_PARITY_EVIDENCE
+task_id=FISH_MASK_ANDROID_P0_V2_2_STARTUP_WARMUP_AND_INFERENCE_OPTIMIZATION
 application_id=com.yujian.fishmasklab
 verified_source_head=$VERIFIED_SOURCE_HEAD
-archive_commit_note=The archive commit adding FISH_MASK_ANDROID_P0_V2_1_EVIDENCE.zip is created after SHA256SUMS finalization; verified_source_head records the exact tested and built source commit SHA.
+archive_commit_note=The evidence archive is generated from the exact tested and built source commit SHA recorded in verified_source_head.
 apk_path=app/build/outputs/apk/debug/app-debug.apk
 apk_sha256=$APK_SHA256
 apk_size_bytes=$APK_SIZE_BYTES

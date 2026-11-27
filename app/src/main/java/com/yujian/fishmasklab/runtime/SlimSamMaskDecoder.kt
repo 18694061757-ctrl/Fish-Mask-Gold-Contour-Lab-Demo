@@ -6,6 +6,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtException
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
+import android.os.SystemClock
 import android.util.Log
 import java.io.File
 import java.nio.FloatBuffer
@@ -21,6 +22,8 @@ data class SamDecoderOutput(
   val iouScores: FloatArray,      // 3 candidate IoU scores
   val predMasksLogits: FloatArray, // [3 * 256 * 256] raw logits
   val decoderDurationMs: Long,
+  val decoderStartNs: Long = 0L,
+  val decoderEndNs: Long = 0L,
 ) {
   companion object {
     const val NUM_CANDIDATES = 3
@@ -45,6 +48,7 @@ class SlimSamMaskDecoder {
 
   private val mutex = Mutex()
   private val gate = NativeSessionGate("SlimSamMaskDecoder")
+  val intraOpThreadCount: Int = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
   private var session: OrtSession? = null
 
   @Volatile
@@ -73,7 +77,7 @@ class SlimSamMaskDecoder {
         val env = OrtEnvironment.getEnvironment()
         val options = OrtSession.SessionOptions().apply {
           setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-          setIntraOpNumThreads(Runtime.getRuntime().availableProcessors().coerceIn(2, 4))
+          setIntraOpNumThreads(intraOpThreadCount)
         }
         val created = options.use { opts ->
           env.createSession(modelFile.absolutePath, opts)
@@ -279,7 +283,7 @@ class SlimSamMaskDecoder {
     pointCount: Int,
     notifyObserver: Boolean,
   ): SamDecoderOutput {
-    val start = System.currentTimeMillis()
+    val startNs = SystemClock.elapsedRealtimeNanos()
     val ptsShape = longArrayOf(1L, 1L, pointCount.toLong(), 2L)
     val lblShape = longArrayOf(1L, 1L, pointCount.toLong())
     val embShape = longArrayOf(1L, 256L, 64L, 64L)
@@ -333,10 +337,13 @@ class SlimSamMaskDecoder {
                 }
               }
 
+              val endNs = SystemClock.elapsedRealtimeNanos().coerceAtLeast(startNs)
               return SamDecoderOutput(
                 iouScores = ious,
                 predMasksLogits = predMasks,
-                decoderDurationMs = (System.currentTimeMillis() - start).coerceAtLeast(0L),
+                decoderDurationMs = ((endNs - startNs) / 1_000_000L).coerceAtLeast(0L),
+                decoderStartNs = startNs,
+                decoderEndNs = endNs,
               )
             }
           }

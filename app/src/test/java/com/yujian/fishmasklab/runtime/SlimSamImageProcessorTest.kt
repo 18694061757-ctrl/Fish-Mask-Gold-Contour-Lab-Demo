@@ -35,8 +35,11 @@ class SlimSamImageProcessorTest {
     assertEquals(1024, cfg.padWidth)
     assertEquals(1024, cfg.padHeight)
     assertEquals(1f / 255f, cfg.rescaleFactor, 1e-6f)
+    assertEquals(2, cfg.resample)
     assertEquals(0.485f, cfg.imageMean[0], 1e-5f)
     assertEquals(0.229f, cfg.imageStd[0], 1e-5f)
+    cfg.validateSlimSam77Contract()
+    assertTrue("Non-bilinear settings must be rejected", runCatching { cfg.copy(resample = 0).validateSlimSam77Contract() }.isFailure)
   }
 
   @Test

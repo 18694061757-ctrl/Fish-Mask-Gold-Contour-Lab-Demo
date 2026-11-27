@@ -69,8 +69,11 @@ jobs:
       - name: Run Unit, Lifecycle, Parity, and Evidence Tests
         run: |
           ./gradlew :app:testDebugUnitTest --rerun-tasks \
-            -Dfishmask.evidence.dir="${PWD}/app/build/evidence/p0_v2_1" \
+            -Dfishmask.evidence.dir="${PWD}/app/build/evidence/p0_v2_2" \
             -Dfishmask.webParityDir="/tmp/ci_web_parity/out"
+
+      - name: Compile Android Instrumentation Tests and Run Lint
+        run: ./gradlew :app:assembleAndroidTest :app:lintDebug
 
       - name: Build Debug APK
         run: ./gradlew :app:assembleDebug
@@ -94,7 +97,7 @@ jobs:
           unzip -l "$APK_PATH" | grep -q "lib/arm64-v8a/libonnxruntime4j_jni.so"
           sha256sum "$APK_PATH" | tee app/build/ci-verify/apk-sha256.txt
 
-      - name: Package and Verify P0-5 Evidence ZIP
+      - name: Package and Verify P0-V2.2 Evidence ZIP
         run: |
           VERIFIED_SOURCE_HEAD="${GITHUB_SHA}" \
             bash scripts/package_evidence.sh
@@ -111,12 +114,12 @@ jobs:
             app/build/ci-verify/build-metadata.txt
           if-no-files-found: error
 
-      - name: Upload P0-5 Evidence ZIP
+      - name: Upload P0-V2.2 Evidence ZIP
         uses: actions/upload-artifact@v4
         with:
           name: fish-mask-evidence-${{ github.sha }}
           path: |
-            FISH_MASK_ANDROID_P0_V2_1_EVIDENCE.zip
+            FISH_MASK_ANDROID_P0_V2_2_EVIDENCE.zip
           if-no-files-found: error
 
       - name: Upload JUnit Test Reports

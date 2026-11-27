@@ -243,7 +243,7 @@ class EvidenceAndParityExportTest {
     val evidenceRoot = File(
       System.getProperty("fishmask.evidence.dir")
         ?: System.getenv("FISHMASK_EVIDENCE_DIR")
-        ?: "build/evidence/p0_v2_1",
+        ?: "build/evidence/p0_v2_2",
     )
     evidenceRoot.mkdirs()
 
@@ -407,7 +407,10 @@ class EvidenceAndParityExportTest {
           )
 
           // 4. processor_metrics.json
-          val pv = cachedCtx.preprocessed.pixelValues
+          // Recompute only for test evidence; the production cache intentionally retains metadata
+          // and embeddings, never the 12 MiB encoder input Tensor.
+          val evidencePreprocessed = requireNotNull(sam.processor).preprocess(loaded.displayBitmap)
+          val pv = evidencePreprocessed.pixelValues
           var pvMin = Float.POSITIVE_INFINITY
           var pvMax = Float.NEGATIVE_INFINITY
           var pvSum = 0.0
@@ -418,15 +421,16 @@ class EvidenceAndParityExportTest {
           }
           File(photoDir, "processor_metrics.json").writeText(
             JSONObject().apply {
-              put("originalWidth", cachedCtx.preprocessed.originalWidth)
-              put("originalHeight", cachedCtx.preprocessed.originalHeight)
-              put("resizedWidth", cachedCtx.preprocessed.resizedWidth)
-              put("resizedHeight", cachedCtx.preprocessed.resizedHeight)
-              put("padWidth", cachedCtx.preprocessed.padWidth)
-              put("padHeight", cachedCtx.preprocessed.padHeight)
-              put("padRight", cachedCtx.preprocessed.padRight)
-              put("padBottom", cachedCtx.preprocessed.padBottom)
-              put("preprocessDurationMs", cachedCtx.preprocessed.preprocessDurationMs)
+              put("originalWidth", evidencePreprocessed.originalWidth)
+              put("originalHeight", evidencePreprocessed.originalHeight)
+              put("resizedWidth", evidencePreprocessed.resizedWidth)
+              put("resizedHeight", evidencePreprocessed.resizedHeight)
+              put("padWidth", evidencePreprocessed.padWidth)
+              put("padHeight", evidencePreprocessed.padHeight)
+              put("padRight", evidencePreprocessed.padRight)
+              put("padBottom", evidencePreprocessed.padBottom)
+              put("preprocessDurationMs", evidencePreprocessed.preprocessDurationMs)
+              put("recomputedForEvidenceOnly", true)
               put("tensorShape", JSONArray(listOf(1, 3, 1024, 1024)))
               put("min", pvMin.toDouble())
               put("max", pvMax.toDouble())
@@ -868,7 +872,7 @@ class EvidenceAndParityExportTest {
       // 12. Root manifest.json
       File(evidenceRoot, "manifest.json").writeText(
         JSONObject().apply {
-          put("taskId", "FISH_MASK_ANDROID_P0_V2_1_CI_NATIVE_PARITY_EVIDENCE")
+          put("taskId", "FISH_MASK_ANDROID_P0_V2_2_STARTUP_WARMUP_AND_INFERENCE_OPTIMIZATION")
           put("applicationId", "com.yujian.fishmasklab")
           put("photoCount", photoSummaries.length())
           put("photos", photoSummaries)

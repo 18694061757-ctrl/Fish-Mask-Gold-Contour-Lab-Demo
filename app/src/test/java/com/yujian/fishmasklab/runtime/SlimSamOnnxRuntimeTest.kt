@@ -15,6 +15,7 @@ import java.io.File
 import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -100,14 +101,49 @@ class SlimSamOnnxRuntimeTest {
       val coordinator = RecognitionPipelineCoordinator(yolox, slimSam)
 
       try {
-        val audit = slimSam.ensureLoaded()
+        coordinator.warmupInBackground()
+        coordinator.warmupInBackground()
+        coordinator.warmupInBackground()
+        withTimeout(120_000L) {
+          while (yolox.runtimeModuleState !in setOf(
+              RuntimeModuleState.INFERENCE_READY,
+              RuntimeModuleState.SKIPPED_RESOURCE,
+              RuntimeModuleState.ERROR,
+            )
+          ) {
+            delay(25L)
+          }
+          while (slimSam.encoderRuntimeState !in setOf(
+              RuntimeModuleState.INFERENCE_READY,
+              RuntimeModuleState.SKIPPED_RESOURCE,
+              RuntimeModuleState.ERROR,
+            )
+          ) {
+            delay(25L)
+          }
+        }
+        val audit = requireNotNull(coordinator.auditReport.value) {
+          "Startup warmup must publish the local asset audit report"
+        }
         assertTrue(
           "SlimSAM assets must be SHA-verified: ${audit.missingAssets} ${audit.shaMismatchedAssets}",
           audit.isSlimSamReady,
         )
         assertTrue("SlimSAM must reach READY state (error=${slimSam.lastError})", slimSam.isReady())
         assertEquals(SlimSamModelState.READY, slimSam.modelState)
-        assertTrue("YOLOX must load", yolox.ensureLoaded())
+        assertTrue("YOLOX must load", yolox.isReady())
+        assertTrue(
+          "YOLOX warmup must succeed or explicitly resource-skip",
+          yolox.runtimeModuleState in setOf(RuntimeModuleState.INFERENCE_READY, RuntimeModuleState.SKIPPED_RESOURCE),
+        )
+        assertTrue(
+          "Encoder prewarm must be ready or explicitly resource-skipped",
+          slimSam.encoderRuntimeState in setOf(RuntimeModuleState.INFERENCE_READY, RuntimeModuleState.SKIPPED_RESOURCE),
+        )
+        assertEquals(RuntimeModuleState.PROCESSOR_READY, slimSam.processorRuntimeState)
+        assertEquals(RuntimeModuleState.INFERENCE_READY, slimSam.decoderRuntimeState)
+        assertEquals("Repeated startup warmup must not recreate YOLOX Session", 1, yolox.sessionCreateCount)
+        assertFalse("Warmup must not populate any user-photo Embedding Cache", slimSam.hasCachedEmbeddingForPhoto(100L))
 
         for ((idx, spec) in specs.withIndex()) {
           val rawBytes = javaClass.classLoader?.getResourceAsStream(spec.filename)?.use { it.readBytes() }
@@ -169,6 +205,10 @@ class SlimSamOnnxRuntimeTest {
             assertTrue(
               "${spec.id} encoder embedding must be cached for photoGenId=$photoGenId",
               slimSam.hasCachedEmbeddingForPhoto(photoGenId),
+            )
+            assertFalse(
+              "Photo cache metadata must not retain the 12 MiB pixel_values Tensor",
+              SamPreprocessedMetadata::class.java.declaredFields.any { it.name == "pixelValues" },
             )
 
             println(
