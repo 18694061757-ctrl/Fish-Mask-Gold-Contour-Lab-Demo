@@ -161,9 +161,16 @@ data class ImageCoordinateMapper(
     ): Pair<Int, Int> {
       val safeW = origWidth.coerceAtLeast(1)
       val safeH = origHeight.coerceAtLeast(1)
-      val scale = targetMaxSide.toDouble() / max(safeW, safeH).toDouble()
-      val resizedW = floor(safeW * scale + 0.5).toInt().coerceIn(1, targetMaxSide)
-      val resizedH = floor(safeH * scale + 0.5).toInt().coerceIn(1, targetMaxSide)
+      val scale = min(
+        targetMaxSide.toDouble() / safeW.toDouble(),
+        targetMaxSide.toDouble() / safeH.toDouble(),
+      )
+      val resizedW = floor(kotlin.math.round(safeW * scale * 100.0) / 100.0)
+        .toInt()
+        .coerceIn(1, targetMaxSide)
+      val resizedH = floor(kotlin.math.round(safeH * scale * 100.0) / 100.0)
+        .toInt()
+        .coerceIn(1, targetMaxSide)
       return resizedW to resizedH
     }
 

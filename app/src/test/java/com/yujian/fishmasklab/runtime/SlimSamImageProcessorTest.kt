@@ -94,4 +94,24 @@ class SlimSamImageProcessorTest {
     assertEquals(0.0f, out.pixelValues[plane + bottomPadIdx], 0.0f)
     assertEquals(0.0f, out.pixelValues[2 * plane + bottomPadIdx], 0.0f)
   }
+
+  @Test
+  fun `preprocessArgb 1279x1706 matches SamImageProcessor rounding 767x1024`() {
+    val origW = 1279
+    val origH = 1706
+    val pixels = IntArray(origW * origH) { 0xFF112233.toInt() }
+    val out = SlimSamImageProcessor().preprocessArgb(pixels, origW, origH)
+
+    assertEquals(767, out.resizedWidth)
+    assertEquals(1024, out.resizedHeight)
+    assertEquals(257, out.padRight)
+    assertEquals(0, out.padBottom)
+
+    // Column 767 must be exact zero-padding (0.0f) matching HuggingFace SamImageProcessor
+    val plane = 1024 * 1024
+    val col767Idx = 500 * 1024 + 767
+    assertEquals(0.0f, out.pixelValues[col767Idx], 0.0f)
+    assertEquals(0.0f, out.pixelValues[plane + col767Idx], 0.0f)
+    assertEquals(0.0f, out.pixelValues[2 * plane + col767Idx], 0.0f)
+  }
 }

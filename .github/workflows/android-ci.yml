@@ -2,9 +2,8 @@ name: Android CI
 
 on:
   push:
-    branches: [ main, "feat/**" ]
-  pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   android-build-and-test:
@@ -19,6 +18,11 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Verify Gradle Wrapper
         run: |
           chmod +x gradlew
@@ -30,23 +34,101 @@ jobs:
           echo "cce23c7b2e5d4f330932738fb67ba518e04b0d99ccdd1cccd22a7da4e01f2971  app/src/main/assets/models/slimsam/onnx/vision_encoder_quantized.onnx" | sha256sum -c -
           echo "cb90b279f549d2cab7fd6e20c38522438c65d84bdcca3d2a764cff7d857fdce2  app/src/main/assets/models/slimsam/onnx/prompt_encoder_mask_decoder_quantized.onnx" | sha256sum -c -
 
+      - name: Generate Temporary Debug Keystore (Gitignored)
+        run: |
+          git check-ignore -v debug.keystore
+          rm -f debug.keystore
+          keytool -genkeypair -v \
+            -keystore debug.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          test -f debug.keystore
+          git check-ignore -v debug.keystore
+
       - name: Setup Gradle cache
         uses: gradle/actions/setup-gradle@v4
+
+      - name: Run Web Parity Reference Runner
+        run: |
+          mkdir -p /tmp/ci_web_parity/out
+          npm install --prefix /tmp/ci_web_parity --no-save --no-audit --no-fund @huggingface/transformers@4.3.2 onnxruntime-web@1.31.1
+          FISHMASK_ROOT_DIR="${PWD}" \
+          WEB_PARITY_OUT_DIR="/tmp/ci_web_parity/out" \
+          WEB_PARITY_NODE_MODULES="/tmp/ci_web_parity/node_modules" \
+          ORT_WASM_PATHS="/tmp/ci_web_parity/node_modules/onnxruntime-web/dist/" \
+            node scripts/web_parity_runner.mjs
 
       - name: Compile Kotlin Debug Sources
         run: ./gradlew :app:compileDebugKotlin
 
-      - name: Run Unit and Real ONNX Robolectric Tests
-        run: ./gradlew :app:testDebugUnitTest
+      - name: Run Unit, Lifecycle, Parity, and Evidence Tests
+        run: |
+          ./gradlew :app:testDebugUnitTest --rerun-tasks \
+            -Dfishmask.evidence.dir="${PWD}/app/build/evidence/p0_v2_1" \
+            -Dfishmask.webParityDir="/tmp/ci_web_parity/out"
 
       - name: Build Debug APK
         run: ./gradlew :app:assembleDebug
 
-      - name: Verify APK Contents and Assets
+      - name: Verify APK Signature, Bundled ONNX Models, and JNI Libs
         run: |
           APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
           test -f "$APK_PATH"
-          unzip -l "$APK_PATH" | grep "assets/models/fish_detector_yolox_nano_v0_1.onnx"
-          unzip -l "$APK_PATH" | grep "assets/models/slimsam/onnx/vision_encoder_quantized.onnx"
-          unzip -l "$APK_PATH" | grep "assets/models/slimsam/onnx/prompt_encoder_mask_decoder_quantized.onnx"
-          sha256sum "$APK_PATH"
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
+          APKSIGNER_BIN=$(find "$SDK_ROOT/build-tools" -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)
+          test -x "$APKSIGNER_BIN"
+          mkdir -p app/build/ci-verify
+          "$APKSIGNER_BIN" verify --verbose --print-certs "$APK_PATH" | tee app/build/ci-verify/apksigner-verify.txt
+
+          unzip -l "$APK_PATH" | grep -E "assets/models/|lib/.*onnxruntime" | tee app/build/ci-verify/apk-assets-verify.txt
+          unzip -p "$APK_PATH" "assets/models/fish_detector_yolox_nano_v0_1.onnx" | sha256sum | grep -q "98257b953b0e9f8aa673572fe4a9749a730ed8a2c014a42b7c492a0e3592c9a1"
+          unzip -p "$APK_PATH" "assets/models/slimsam/onnx/vision_encoder_quantized.onnx" | sha256sum | grep -q "cce23c7b2e5d4f330932738fb67ba518e04b0d99ccdd1cccd22a7da4e01f2971"
+          unzip -p "$APK_PATH" "assets/models/slimsam/onnx/prompt_encoder_mask_decoder_quantized.onnx" | sha256sum | grep -q "cb90b279f549d2cab7fd6e20c38522438c65d84bdcca3d2a764cff7d857fdce2"
+          unzip -l "$APK_PATH" | grep -q "lib/arm64-v8a/libonnxruntime.so"
+          unzip -l "$APK_PATH" | grep -q "lib/arm64-v8a/libonnxruntime4j_jni.so"
+          sha256sum "$APK_PATH" | tee app/build/ci-verify/apk-sha256.txt
+
+      - name: Package and Verify P0-5 Evidence ZIP
+        run: |
+          VERIFIED_SOURCE_HEAD="${GITHUB_SHA}" \
+            bash scripts/package_evidence.sh
+
+      - name: Upload Debug APK & Build Metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: fish-mask-android-debug-${{ github.sha }}
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/ci-verify/apk-sha256.txt
+            app/build/ci-verify/apksigner-verify.txt
+            app/build/ci-verify/apk-assets-verify.txt
+            app/build/ci-verify/build-metadata.txt
+          if-no-files-found: error
+
+      - name: Upload P0-5 Evidence ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: fish-mask-evidence-${{ github.sha }}
+          path: |
+            FISH_MASK_ANDROID_P0_V2_1_EVIDENCE.zip
+          if-no-files-found: error
+
+      - name: Upload JUnit Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fish-mask-junit-${{ github.sha }}
+          path: |
+            app/build/test-results/testDebugUnitTest/*.xml
+            app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: warn
+
+      - name: Clean Temporary Keystore
+        if: always()
+        run: rm -f debug.keystore
