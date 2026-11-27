@@ -1,0 +1,6 @@
+{
+  "name": "Fish Mask Gold Contour Lab",
+  "description": "Native Android fish catch photography experience featuring local ONNX detection, segmentation contour geometry, and blue-gold water light rendering.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

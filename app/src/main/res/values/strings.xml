@@ -1,0 +1,32 @@
+<resources>
+    <string name="app_name">Fish Mask Gold Contour Lab</string>
+    <string name="brand_title">FISH MASK</string>
+    <string name="brand_subtitle">GOLD CONTOUR EXPERIENCE</string>
+    <string name="empty_headline">让每一尾渔获，都值得珍藏。</string>
+    <string name="empty_subhead">上传真实鱼获照片，自动生成专属光影轮廓。</string>
+    <string name="action_take_photo">拍摄鱼获</string>
+    <string name="action_pick_photo">从相册选择</string>
+    <string name="action_change_photo">换一张</string>
+    <string name="action_replay">重播</string>
+    <string name="action_cancel">取消</string>
+    <string name="action_capture">拍照</string>
+    <string name="action_retry_pick">重新选择照片</string>
+    <string name="action_back_home">返回首页</string>
+    <string name="status_preparing_photo">正在准备照片</string>
+    <string name="status_finding_fish">正在寻找鱼体</string>
+    <string name="status_segmenting_edge">正在识别鱼体边缘</string>
+    <string name="status_building_contour">正在生成光影轮廓</string>
+    <string name="status_lighting_catch">正在点亮鱼获</string>
+    <string name="error_no_clear_fish">未找到清晰鱼体。</string>
+    <string name="error_segmentation_failed">鱼体分割失败。</string>
+    <string name="error_model_init_failed">模型初始化失败。</string>
+    <string name="error_recognition_incomplete">本次识别未完成。</string>
+    <string name="camera_permission_rationale">需要相机权限才能拍摄鱼获照片。</string>
+    <string name="camera_permission_denied">未获得相机权限，您仍可以从相册选择照片。</string>
+    <string name="camera_capture_hint">将鱼获完整置于画面中央</string>
+    <string name="cd_brand_emblem">Fish Mask 鱼获轮廓徽标</string>
+    <string name="cd_catch_photo">用户上传的鱼获照片</string>
+    <string name="cd_camera_preview">相机取景画面</string>
+    <string name="cd_shimmer_contour">鱼体蓝金光影轮廓层</string>
+    <string name="source_sheet_title">选择新的鱼获照片</string>
+</resources>
