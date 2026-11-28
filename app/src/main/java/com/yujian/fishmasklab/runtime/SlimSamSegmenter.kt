@@ -135,7 +135,7 @@ class SlimSamSegmenter(
   fun isReady(): Boolean =
     !closed &&
       status == ModelRuntimeStatus.READY &&
-      modelState == SlimSamModelState.READY &&
+      (modelState == SlimSamModelState.READY || modelState == SlimSamModelState.INFERENCE_RUNNING) &&
       encoder.isLoaded() &&
       decoder.isLoaded() &&
       processor != null

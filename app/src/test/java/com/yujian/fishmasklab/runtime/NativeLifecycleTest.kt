@@ -248,6 +248,10 @@ class NativeLifecycleTest {
       )
       assertTrue(refocusTask > 0L)
       assertTrue("Decoder run must start", decoderEntered.await(15, TimeUnit.SECONDS))
+      assertTrue(
+        "Loaded SlimSAM sessions remain ready while decoder inference is running",
+        segmenter.isReady(),
+      )
 
       val shutdownDeferred = async(Dispatchers.Default) {
         vm.clearForTestAndAwait()
