@@ -1,0 +1,38 @@
+{
+  "source_torchscript": "mobile-analysis/model_torchscript.pt",
+  "source_sha256": "61319bfee5848ca7d0894d1b22feebe2ac0804a516352a43c26c4ad175204ef1",
+  "model_family": "mobilenet_v3_small",
+  "image_size": 224,
+  "num_classes": 15,
+  "class_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14
+  ],
+  "tflite_path": "mobile-analysis/fish_classifier_v0_2.tflite",
+  "tflite_size": 6244908,
+  "tflite_sha256": "29c2f2fd1608178f023b8e35edf632c0dd685df4a7ae1c3562220a7352ccce18",
+  "flatbuffer_identifier": "TFL3",
+  "torch_to_litert_max_abs": 2.9206275939941406e-06,
+  "tensor_contract": {
+    "logical_input": "RGB float32, ImageNet normalized",
+    "pytorch_layout": "NCHW",
+    "spatial_size": [
+      224,
+      224
+    ],
+    "output_classes": 15
+  }
+}

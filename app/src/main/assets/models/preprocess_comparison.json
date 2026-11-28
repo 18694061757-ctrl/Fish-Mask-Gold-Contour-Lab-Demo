@@ -1,0 +1,44 @@
+{
+  "model_version": "MODEL_CROP_M1_v0.2",
+  "dataset_version": "DS_M1_v1.1",
+  "evaluated_split": "test",
+  "requested_limit": 200,
+  "evaluated": 200,
+  "failed": 0,
+  "image_size": 224,
+  "num_classes": 15,
+  "center_crop": {
+    "count": 200,
+    "top1_accuracy": 0.76,
+    "top3_accuracy": 0.91,
+    "mean_top1_confidence": 0.794399
+  },
+  "whole_image_letterbox": {
+    "count": 200,
+    "top1_accuracy": 0.77,
+    "top3_accuracy": 0.92,
+    "mean_top1_confidence": 0.785808
+  },
+  "top1_accuracy_delta_letterbox_minus_center": 0.01,
+  "prediction_disagreement_rate": 0.155,
+  "letterbox_contract": {
+    "resize": "preserve aspect ratio, fit entire image inside square",
+    "padding_rgb": [
+      124,
+      116,
+      104
+    ],
+    "normalization_mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "normalization_std": [
+      0.229,
+      0.224,
+      0.225
+    ],
+    "cropping": "none"
+  },
+  "failures": []
+}
