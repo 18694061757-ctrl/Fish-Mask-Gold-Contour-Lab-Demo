@@ -214,8 +214,9 @@ class YoloxFishDetector(
             }
           }
         }
+        val modelBytes = cachedModelFile.readBytes()
         val created = options.use { opts ->
-          env.createSession(cachedModelFile.absolutePath, opts)
+          env.createSession(modelBytes, opts)
         }
         unpublishedSession = created
         val contractSummary = validateContract(created)
@@ -361,30 +362,24 @@ class YoloxFishDetector(
       return false
     }
 
-    val tempFile = File(destination.parentFile, "${destination.name}.tmp.${System.nanoTime()}")
-    try {
-      val digest = MessageDigest.getInstance("SHA-256")
-      val buffer = ByteArray(32 * 1024)
-      context.assets.open(ModelAssetAudit.YOLOX_ASSET_PATH).use { input ->
-        tempFile.outputStream().use { output ->
-          while (true) {
-            val read = input.read(buffer)
-            if (read <= 0) break
-            digest.update(buffer, 0, read)
-            output.write(buffer, 0, read)
-          }
-          output.fd.sync()
+    val digest = MessageDigest.getInstance("SHA-256")
+    val buffer = ByteArray(32 * 1024)
+    context.assets.open(ModelAssetAudit.YOLOX_ASSET_PATH).use { input ->
+      destination.outputStream().use { output ->
+        while (true) {
+          val read = input.read(buffer)
+          if (read <= 0) break
+          digest.update(buffer, 0, read)
+          output.write(buffer, 0, read)
         }
+        output.flush()
       }
-      val actualSha = digest.digest().joinToString("") { "%02x".format(it) }
-      check(actualSha.equals(ModelAssetAudit.YOLOX_EXPECTED_SHA256, ignoreCase = true)) {
-        "YOLOX asset SHA-256 mismatch: expected=${ModelAssetAudit.YOLOX_EXPECTED_SHA256}, actual=$actualSha"
-      }
-      Os.rename(tempFile.absolutePath, destination.absolutePath)
-      return true
-    } finally {
-      runCatching { if (tempFile.exists()) tempFile.delete() }
     }
+    val actualSha = digest.digest().joinToString("") { "%02x".format(it) }
+    check(actualSha.equals(ModelAssetAudit.YOLOX_EXPECTED_SHA256, ignoreCase = true)) {
+      "YOLOX asset SHA-256 mismatch: expected=${ModelAssetAudit.YOLOX_EXPECTED_SHA256}, actual=$actualSha"
+    }
+    return true
   }
 
   /** Executes one isolated real-shape tensor Run without interpreting detections or touching UI state. */

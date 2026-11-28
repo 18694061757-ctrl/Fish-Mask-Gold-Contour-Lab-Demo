@@ -268,18 +268,17 @@ class SlimSamSegmenter(
         )
         recorder?.updateModuleState("PROCESSOR", RuntimeModuleState.PROCESSOR_READY)
 
-        // Install ONNX models atomically into app filesDir with SHA-256 validation
-        val onnxDir = File(context.filesDir, "models/slimsam/onnx")
+        // Install ONNX models atomically into app cacheDir with SHA-256 validation
         val installStartNs = SystemClock.elapsedRealtimeNanos()
         val encoderFile = installAssetAtomically(
           assetPath = ModelAssetAudit.SLIMSAM_ENCODER_PATH,
           expectedSha256 = ModelAssetAudit.SLIMSAM_ENCODER_EXPECTED_SHA256,
-          destFile = File(onnxDir, "vision_encoder_quantized.onnx"),
+          destFile = File(context.cacheDir, "slimsam_vision_encoder.onnx"),
         )
         val decoderFile = installAssetAtomically(
           assetPath = ModelAssetAudit.SLIMSAM_DECODER_PATH,
           expectedSha256 = ModelAssetAudit.SLIMSAM_DECODER_EXPECTED_SHA256,
-          destFile = File(onnxDir, "prompt_encoder_mask_decoder_quantized.onnx"),
+          destFile = File(context.cacheDir, "slimsam_mask_decoder.onnx"),
         )
         val installEndNs = SystemClock.elapsedRealtimeNanos().coerceAtLeast(installStartNs)
         recorder?.recordWarmupStageDuration(
@@ -731,35 +730,28 @@ class SlimSamSegmenter(
       destFile.delete()
     }
 
-    val tmpFile = File(destFile.parentFile, "${destFile.name}.tmp.${System.nanoTime()}")
-    try {
-      val digest = MessageDigest.getInstance("SHA-256")
-      val buffer = ByteArray(32 * 1024)
-      context.assets.open(assetPath).use { input ->
-        tmpFile.outputStream().use { output ->
-          while (true) {
-            val read = input.read(buffer)
-            if (read <= 0) break
-            digest.update(buffer, 0, read)
-            output.write(buffer, 0, read)
-          }
-          output.fd.sync()
+    val digest = MessageDigest.getInstance("SHA-256")
+    val buffer = ByteArray(32 * 1024)
+    context.assets.open(assetPath).use { input ->
+      destFile.outputStream().use { output ->
+        while (true) {
+          val read = input.read(buffer)
+          if (read <= 0) break
+          digest.update(buffer, 0, read)
+          output.write(buffer, 0, read)
         }
+        output.flush()
       }
-      val actualSha = digest.digest().joinToString("") { "%02x".format(it) }
-      if (!actualSha.equals(expectedSha256, ignoreCase = true)) {
-        throw SlimSamRuntimeException(
-          SlimSamErrorCode.ASSET_HASH_MISMATCH,
-          "Asset '$assetPath' SHA-256 mismatch: expected $expectedSha256, got $actualSha",
-        )
-      }
-      // Same-directory rename is atomic on Android/Linux and replaces a corrupt old cache safely.
-      Os.rename(tmpFile.absolutePath, destFile.absolutePath)
-      return destFile
-    } catch (t: Throwable) {
-      runCatching { tmpFile.delete() }
-      throw t
     }
+    val actualSha = digest.digest().joinToString("") { "%02x".format(it) }
+    if (!actualSha.equals(expectedSha256, ignoreCase = true)) {
+      destFile.delete()
+      throw SlimSamRuntimeException(
+        SlimSamErrorCode.ASSET_HASH_MISMATCH,
+        "Asset '$assetPath' SHA-256 mismatch: expected $expectedSha256, got $actualSha",
+      )
+    }
+    return destFile
   }
 
   private fun sha256File(file: File): String {

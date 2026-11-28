@@ -79,8 +79,9 @@ class SlimSamMaskDecoder {
           setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
           setIntraOpNumThreads(intraOpThreadCount)
         }
+        val modelBytes = modelFile.readBytes()
         val created = options.use { opts ->
-          env.createSession(modelFile.absolutePath, opts)
+          env.createSession(modelBytes, opts)
         }
         try {
           val summary = validateContract(created)
