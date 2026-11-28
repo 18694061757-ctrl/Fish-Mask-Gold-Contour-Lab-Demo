@@ -94,6 +94,10 @@ class YoloxFishDetector(
   @Volatile
   internal var nativeRunObserver: ((String) -> Unit)? = null
 
+  /** Test-only synchronous sink for the exact YOLOX input and raw output tensors. */
+  @Volatile
+  internal var nativeTensorsObserverForTest: ((FloatArray, FloatArray, Int, Int) -> Unit)? = null
+
   @Volatile
   internal var sessionClosedObserver: ((String) -> Unit)? = null
 
@@ -585,6 +589,7 @@ class YoloxFishDetector(
           val fb = outTensor.floatBuffer
           flatOutput = FloatArray(numRows * stride)
           fb.get(flatOutput)
+          nativeTensorsObserverForTest?.invoke(tensorData, flatOutput, numRows, stride)
           val readEndNs = SystemClock.elapsedRealtimeNanos().coerceAtLeast(readStartNs)
           stages.add(YoloxStageSpan("yolox_output_tensor_read", readStartNs, readEndNs))
         }

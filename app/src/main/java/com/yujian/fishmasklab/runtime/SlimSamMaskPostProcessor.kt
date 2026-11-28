@@ -22,6 +22,10 @@ object SlimSamMaskPostProcessor {
   private const val SRC_SIZE = SamDecoderOutput.MASK_LOGIT_SIZE // 256
   private const val PAD_SIZE = SlimSamVisionEncoder.INPUT_SIZE   // 1024
 
+  /** Optional synchronous sink for test evidence; production leaves it null and allocates nothing extra. */
+  @Volatile
+  internal var stageObserverForTest: ((Int, String, FloatArray?, ByteArray?) -> Unit)? = null
+
   fun postProcessCandidateLogits(
     logits256: FloatArray,
     logitOffset: Int,
@@ -30,6 +34,7 @@ object SlimSamMaskPostProcessor {
     originalWidth: Int,
     originalHeight: Int,
     upsampled1024Scratch: FloatArray = FloatArray(PAD_SIZE * PAD_SIZE),
+    stageObserver: ((String, FloatArray?, ByteArray?) -> Unit)? = null,
   ): ByteArray {
     require(logits256.size >= logitOffset + SRC_SIZE * SRC_SIZE) {
       "Insufficient logits buffer size ${logits256.size} for offset $logitOffset"
@@ -41,19 +46,43 @@ object SlimSamMaskPostProcessor {
       "Invalid original dims ${originalWidth}x$originalHeight"
     }
 
-    // Step 1: Bilinear upsample 256x256 -> 1024x1024 (align_corners=false)
-    // Only need rows 0 until resizedHeight and cols 0 until resizedWidth since padding is cropped
-    bilinearUpsampleCroppedRegion(
-      src = logits256,
-      srcOffset = logitOffset,
-      srcW = SRC_SIZE,
-      srcH = SRC_SIZE,
-      fullDstW = PAD_SIZE,
-      fullDstH = PAD_SIZE,
-      cropW = resizedWidth,
-      cropH = resizedHeight,
-      dst = upsampled1024Scratch,
-    )
+    // Step 1: Bilinear upsample 256x256 -> 1024x1024 (align_corners=false).
+    // The normal runtime stores only the retained region. The test observer requests the full
+    // stage once and the same full-stage values are cropped into the normal scratch buffer.
+    if (stageObserver != null) {
+      val upsampled1024 = FloatArray(PAD_SIZE * PAD_SIZE)
+      bilinearUpsampleCroppedRegion(
+        src = logits256,
+        srcOffset = logitOffset,
+        srcW = SRC_SIZE,
+        srcH = SRC_SIZE,
+        fullDstW = PAD_SIZE,
+        fullDstH = PAD_SIZE,
+        cropW = PAD_SIZE,
+        cropH = PAD_SIZE,
+        dst = upsampled1024,
+      )
+      stageObserver("upsampled_1024", upsampled1024, null)
+      val paddingCropped = FloatArray(resizedWidth * resizedHeight)
+      for (y in 0 until resizedHeight) {
+        System.arraycopy(upsampled1024, y * PAD_SIZE, paddingCropped, y * resizedWidth, resizedWidth)
+        System.arraycopy(paddingCropped, y * resizedWidth, upsampled1024Scratch, y * resizedWidth, resizedWidth)
+      }
+      stageObserver("padding_cropped", paddingCropped, null)
+    } else {
+      // Only need rows 0 until resizedHeight and cols 0 until resizedWidth since padding is cropped.
+      bilinearUpsampleCroppedRegion(
+        src = logits256,
+        srcOffset = logitOffset,
+        srcW = SRC_SIZE,
+        srcH = SRC_SIZE,
+        fullDstW = PAD_SIZE,
+        fullDstH = PAD_SIZE,
+        cropW = resizedWidth,
+        cropH = resizedHeight,
+        dst = upsampled1024Scratch,
+      )
+    }
 
     // Step 2 & 3: Crop [resizedHeight, resizedWidth] and bilinear resize -> [originalHeight, originalWidth]
     // Threshold logit > 0.0f into binary mask ByteArray
@@ -74,6 +103,7 @@ object SlimSamMaskPostProcessor {
 
     val yScale = resizedHeight.toFloat() / originalHeight.toFloat()
     val maxCropY = (resizedHeight - 1).coerceAtLeast(0)
+    val resizedOriginal = if (stageObserver != null) FloatArray(originalWidth * originalHeight) else null
     for (y in 0 until originalHeight) {
       val sy = ((y + 0.5f) * yScale - 0.5f).coerceIn(0f, maxCropY.toFloat())
       val y0 = floor(sy).toInt()
@@ -97,11 +127,15 @@ object SlimSamMaskPostProcessor {
         val v11 = upsampled1024Scratch[row1 + x1]
 
         val logit = (v00 * invWx + v10 * wx) * invWy + (v01 * invWx + v11 * wx) * wy
+        resizedOriginal?.set(dstRow + x, logit)
         if (logit > 0.0f) {
           outMask[dstRow + x] = 0xFF.toByte()
         }
       }
     }
+
+    if (resizedOriginal != null) stageObserver?.invoke("resized_original", resizedOriginal, null)
+    stageObserver?.invoke("threshold_mask", null, outMask)
 
     return outMask
   }
@@ -178,9 +212,19 @@ object SlimSamMaskPostProcessor {
   ): MaskResult {
     val totalPixels = max(1, originalWidth * originalHeight)
     val scratch = FloatArray(PAD_SIZE * PAD_SIZE)
+    val stageObserver = stageObserverForTest
     val candidates = ArrayList<CandidateMask>(SamDecoderOutput.NUM_CANDIDATES)
 
     for (c in 0 until SamDecoderOutput.NUM_CANDIDATES) {
+      stageObserver?.invoke(
+        c,
+        "logits_256",
+        decoderOutput.predMasksLogits.copyOfRange(
+          c * SamDecoderOutput.MASK_PLANE_ELEMENTS,
+          (c + 1) * SamDecoderOutput.MASK_PLANE_ELEMENTS,
+        ),
+        null,
+      )
       val binaryMask = postProcessCandidateLogits(
         logits256 = decoderOutput.predMasksLogits,
         logitOffset = c * SamDecoderOutput.MASK_PLANE_ELEMENTS,
@@ -189,6 +233,9 @@ object SlimSamMaskPostProcessor {
         originalWidth = originalWidth,
         originalHeight = originalHeight,
         upsampled1024Scratch = scratch,
+        stageObserver = if (stageObserver == null) null else { stage, floats, mask ->
+          stageObserver.invoke(c, stage, floats, mask)
+        },
       )
       MaskQualityGate.clipMaskWithExpandedDetectionBox(
         mask = binaryMask,
@@ -196,7 +243,9 @@ object SlimSamMaskPostProcessor {
         height = originalHeight,
         detectionBox = detection?.box,
       )
+      stageObserver?.invoke(c, "clipped_mask", null, binaryMask)
       val lcc = ContourGeometry.getLargestConnectedComponent(binaryMask, originalWidth, originalHeight)
+      stageObserver?.invoke(c, "lcc_mask", null, lcc.cleanMask)
       val iou = decoderOutput.iouScores[c]
       val areaRatio = lcc.pixelCount.toFloat() / totalPixels.toFloat()
       val draft = CandidateMask(
