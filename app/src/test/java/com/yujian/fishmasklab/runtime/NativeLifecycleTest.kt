@@ -328,7 +328,11 @@ class NativeLifecycleTest {
             .filterIsInstance<PipelineProgressEvent.StateChanged>()
             .first { it.taskId == lastTapTask && (it.state == PipelineState.PLAYING || it.state == PipelineState.ERROR) }
         }
-        assertEquals(PipelineState.PLAYING, finalEvent.state)
+        assertEquals(
+          "Final rapid refocus failed: ${finalEvent.errorReason} ${finalEvent.diagnosticMessage}",
+          PipelineState.PLAYING,
+          finalEvent.state,
+        )
         assertTrue("Final tap refocus must reuse cached embedding", finalEvent.reusedEncoderEmbedding)
         assertEquals("Decoder calls must never overlap concurrently", 1, maxConcurrentDecodes.get())
       } finally {
