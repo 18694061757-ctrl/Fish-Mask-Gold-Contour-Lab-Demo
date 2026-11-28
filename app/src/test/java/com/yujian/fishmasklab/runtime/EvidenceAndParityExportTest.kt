@@ -1336,7 +1336,12 @@ class EvidenceAndParityExportTest {
                 put("webOriginalPrompts", webOriginalPrompts)
                 put("androidSamCoordinatesShape", JSONArray(listOf(1, 1, androidLabels.size, 2)))
                 put("androidSamLabelsShape", JSONArray(listOf(1, 1, androidLabels.size)))
-                put("webNodeSamCoordinatesShape", JSONObject(File(webPhotoOut, "tensors/sam_node_input_shapes.json").readText()).getJSONArray("inputPoints"))
+                put(
+                  "webNodeSamCoordinatesShape",
+                  JSONObject(File(webPhotoOut, "tensors/sam_node_input_shapes.json").readText())
+                    .getJSONObject("inputPoints")
+                    .getJSONArray("shape"),
+                )
                 put("androidSamCoordinatesSha256", sha256File(File(tensorDir, "sam_input_points_android.f32")))
                 put("androidSamLabelsSha256", sha256File(File(tensorDir, "sam_input_labels_android.i64")))
                 put("webNodeSamCoordinatesSha256", sha256File(File(webPhotoOut, "tensors/sam_input_points_node.f32")))
