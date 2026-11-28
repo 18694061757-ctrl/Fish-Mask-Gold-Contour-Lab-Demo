@@ -226,7 +226,7 @@ class YoloxFishDetector(
         val published = gate.publishIfOpen {
           ortEnv = env
           session = created
-          this.contractSummary = contractSummary
+          this@YoloxFishDetector.contractSummary = contractSummary
           sessionCreateCount += 1
           executionProviderName = activeEp
           val readyNowNs = SystemClock.elapsedRealtimeNanos().coerceAtLeast(totalStartNs)

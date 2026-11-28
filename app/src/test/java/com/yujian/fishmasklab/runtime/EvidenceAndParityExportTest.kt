@@ -409,7 +409,7 @@ class EvidenceAndParityExportTest {
           // 4. processor_metrics.json
           // Recompute only for test evidence; the production cache intentionally retains metadata
           // and embeddings, never the 12 MiB encoder input Tensor.
-          val evidencePreprocessed = requireNotNull(sam.processor).preprocess(loaded.displayBitmap)
+          val evidencePreprocessed = requireNotNull(slimSam.processor).preprocess(loaded.displayBitmap)
           val pv = evidencePreprocessed.pixelValues
           var pvMin = Float.POSITIVE_INFINITY
           var pvMax = Float.NEGATIVE_INFINITY

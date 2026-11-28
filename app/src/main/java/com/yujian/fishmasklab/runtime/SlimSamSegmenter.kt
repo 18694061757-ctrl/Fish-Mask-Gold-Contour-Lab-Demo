@@ -15,6 +15,7 @@ import java.security.MessageDigest
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -559,17 +560,18 @@ class SlimSamSegmenter(
     photoBitmap: Bitmap,
     onStage: (SlimSamStage) -> Unit,
   ): Pair<SamPreprocessedMetadata, SamImageEmbedding> {
-    ensureActive()
+    val coroutineContext = currentCoroutineContext()
+    coroutineContext.ensureActive()
     onStage(SlimSamStage.PREPROCESSING)
     val preprocessed = activeProcessor.preprocess(photoBitmap)
-    ensureActive()
+    coroutineContext.ensureActive()
     if (closed) {
       throw CancellationException("SlimSamSegmenter closed before Vision Encoder")
     }
     val metadata = SamPreprocessedMetadata.from(preprocessed)
     onStage(SlimSamStage.ENCODER)
     val embedding = encoder.encode(preprocessed.pixelValues)
-    ensureActive()
+    coroutineContext.ensureActive()
     return metadata to embedding
   }
 
