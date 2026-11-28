@@ -2,6 +2,8 @@ name: Android CI
 
 on:
   push:
+    branches: [ main, fix/fish-crop-parity-v2-2-2 ]
+  pull_request:
     branches: [ main ]
   workflow_dispatch:
 
@@ -53,24 +55,45 @@ jobs:
       - name: Setup Gradle cache
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run Web Parity Reference Runner
+      - name: Compile Kotlin Debug Sources
+        run: ./gradlew :app:compileDebugKotlin
+
+      - name: Run Full Unit and Real ONNX Regression Suite
         run: |
-          mkdir -p /tmp/ci_web_parity/out
+          ./gradlew :app:testDebugUnitTest --rerun-tasks \
+            -Dfishmask.evidence.dir="${PWD}/app/build/evidence/p0_v2_2"
+          mkdir -p app/build/junit-full-suite
+          cp -a app/build/test-results/testDebugUnitTest/. app/build/junit-full-suite/
+
+      - name: Run Web ONNX Tensor Reference with Android Inputs
+        run: |
+          mkdir -p app/build/ci-web-parity/out
           npm install --prefix /tmp/ci_web_parity --no-save --no-audit --no-fund @huggingface/transformers@4.3.2 onnxruntime-web@1.31.1
           FISHMASK_ROOT_DIR="${PWD}" \
-          WEB_PARITY_OUT_DIR="/tmp/ci_web_parity/out" \
+          ANDROID_EVIDENCE_DIR="${PWD}/app/build/evidence/p0_v2_2" \
+          WEB_PARITY_OUT_DIR="${PWD}/app/build/ci-web-parity/out" \
           WEB_PARITY_NODE_MODULES="/tmp/ci_web_parity/node_modules" \
           ORT_WASM_PATHS="/tmp/ci_web_parity/node_modules/onnxruntime-web/dist/" \
             node scripts/web_parity_runner.mjs
 
-      - name: Compile Kotlin Debug Sources
-        run: ./gradlew :app:compileDebugKotlin
-
-      - name: Run Unit, Lifecycle, Parity, and Evidence Tests
+      - name: Run Exact-Input Web Android Parity Gates
         run: |
+          set +e
           ./gradlew :app:testDebugUnitTest --rerun-tasks \
+            --tests "com.yujian.fishmasklab.runtime.EvidenceAndParityExportTest" \
             -Dfishmask.evidence.dir="${PWD}/app/build/evidence/p0_v2_2" \
-            -Dfishmask.webParityDir="/tmp/ci_web_parity/out"
+            -Dfishmask.webParityDir="${PWD}/app/build/ci-web-parity/out"
+          PARITY_EXIT=$?
+          set -e
+
+          mkdir -p app/build/junit-final
+          cp app/build/junit-full-suite/*.xml app/build/junit-final/
+          PARITY_XML="app/build/test-results/testDebugUnitTest/TEST-com.yujian.fishmasklab.runtime.EvidenceAndParityExportTest.xml"
+          if [ -s "$PARITY_XML" ]; then cp "$PARITY_XML" app/build/junit-final/; fi
+          rm -rf app/build/test-results/testDebugUnitTest
+          mkdir -p app/build/test-results/testDebugUnitTest
+          cp app/build/junit-final/*.xml app/build/test-results/testDebugUnitTest/
+          exit "$PARITY_EXIT"
 
       - name: Compile Android Instrumentation Tests and Run Lint
         run: ./gradlew :app:assembleAndroidTest :app:lintDebug
@@ -130,6 +153,18 @@ jobs:
           path: |
             app/build/test-results/testDebugUnitTest/*.xml
             app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: warn
+
+      - name: Upload Fish Crop Numerical Diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fish-mask-v2-2-2-diagnostics-${{ github.sha }}
+          path: |
+            app/build/ci-web-parity/out/
+            app/build/evidence/p0_v2_2/
+            app/build/junit-full-suite/
+            app/build/test-results/testDebugUnitTest/*.xml
           if-no-files-found: warn
 
       - name: Clean Temporary Keystore

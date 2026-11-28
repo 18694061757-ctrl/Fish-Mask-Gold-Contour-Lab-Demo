@@ -47,6 +47,7 @@ class SlimSamMaskDecoder {
   }
 
   private val mutex = Mutex()
+  private val inferenceMutex = Mutex()
   private val gate = NativeSessionGate("SlimSamMaskDecoder")
   val intraOpThreadCount: Int = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
   private var session: OrtSession? = null
@@ -237,40 +238,43 @@ class SlimSamMaskDecoder {
     require(pointCount > 0 && pointCoords.size == pointCount * 2 && pointLabels.size == pointCount) {
       "Invalid prompt tensor counts: pointCount=$pointCount, coords=${pointCoords.size}, labels=${pointLabels.size}"
     }
-    if (gate.isClosingOrClosed()) {
-      throw CancellationException("SlimSamMaskDecoder is closing or closed")
-    }
-    val env = OrtEnvironment.getEnvironment()
-    try {
-      gate.withNativeOperation {
-        val activeSession = session ?: throw SlimSamRuntimeException(
-          SlimSamErrorCode.SESSION_CREATE_FAILED,
-          "Mask Decoder session is not loaded",
-        )
-        executeSession(
-          env = env,
-          s = activeSession,
-          imageEmbeddings = embedding.imageEmbeddings,
-          positionalEmbeddings = embedding.imagePositionalEmbeddings,
-          pointCoords = pointCoords,
-          pointLabels = pointLabels,
-          pointCount = pointCount,
-          notifyObserver = true,
+    inferenceMutex.withLock {
+      ensureActive()
+      if (gate.isClosingOrClosed()) {
+        throw CancellationException("SlimSamMaskDecoder is closing or closed")
+      }
+      val env = OrtEnvironment.getEnvironment()
+      try {
+        gate.withNativeOperation {
+          val activeSession = session ?: throw SlimSamRuntimeException(
+            SlimSamErrorCode.SESSION_CREATE_FAILED,
+            "Mask Decoder session is not loaded",
+          )
+          executeSession(
+            env = env,
+            s = activeSession,
+            imageEmbeddings = embedding.imageEmbeddings,
+            positionalEmbeddings = embedding.imagePositionalEmbeddings,
+            pointCoords = pointCoords,
+            pointLabels = pointLabels,
+            pointCount = pointCount,
+            notifyObserver = true,
+          )
+        }
+      } catch (ce: CancellationException) {
+        throw ce
+      } catch (sre: SlimSamRuntimeException) {
+        throw sre
+      } catch (oe: OrtException) {
+        val code = classifyOrtException(oe, defaultCode = SlimSamErrorCode.DECODER_FAILED)
+        throw SlimSamRuntimeException(code, "Mask Decoder execution failed: ${oe.message}", oe)
+      } catch (t: Throwable) {
+        throw SlimSamRuntimeException(
+          SlimSamErrorCode.DECODER_FAILED,
+          "Mask Decoder execution failed: ${t.message ?: t.javaClass.simpleName}",
+          t,
         )
       }
-    } catch (ce: CancellationException) {
-      throw ce
-    } catch (sre: SlimSamRuntimeException) {
-      throw sre
-    } catch (oe: OrtException) {
-      val code = classifyOrtException(oe, defaultCode = SlimSamErrorCode.DECODER_FAILED)
-      throw SlimSamRuntimeException(code, "Mask Decoder execution failed: ${oe.message}", oe)
-    } catch (t: Throwable) {
-      throw SlimSamRuntimeException(
-        SlimSamErrorCode.DECODER_FAILED,
-        "Mask Decoder execution failed: ${t.message ?: t.javaClass.simpleName}",
-        t,
-      )
     }
   }
 

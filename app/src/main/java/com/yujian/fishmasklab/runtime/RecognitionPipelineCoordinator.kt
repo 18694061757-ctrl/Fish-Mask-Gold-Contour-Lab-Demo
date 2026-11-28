@@ -485,7 +485,10 @@ class RecognitionPipelineCoordinator(
           performanceRecorder?.captureResourceSample("before_yolox_inference", taskId, photoGenerationId)
           emitIfCurrent(taskId, photoGenerationId, PipelineState.DETECTING)
           val outcome = withTimeout(INFERENCE_TIMEOUT_MS) {
-            yoloxDetector.detectDetailed(workBitmap, mapper)
+            // Use the canonical display/original-coordinate bitmap for detection. The work bitmap is
+            // pre-downscaled to 1024px and would introduce a second resize before YOLOX, while SAM,
+            // the mapper, and the Web reference all use the canonical photo dimensions.
+            yoloxDetector.detectDetailed(samBitmap, mapper)
           }
           val det = outcome.detection
           detectorDurationMs = outcome.totalDurationMs

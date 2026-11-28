@@ -122,12 +122,20 @@ class SlimSamSegmenter(
   internal var lastInferenceResultForTest: SlimSamInferenceResult? = null
     private set
 
+  /** Test-only sink for the exact preprocessing tensor passed to the real ONNX encoder Run. */
+  @Volatile
+  internal var encoderInputObserverForTest: ((SamPreprocessedImage) -> Unit)? = null
+
+  /** Test-only sink for the exact prompts and embeddings passed to the real ONNX decoder Run. */
+  @Volatile
+  internal var decoderInputsObserverForTest: ((FloatArray, LongArray, SamImageEmbedding) -> Unit)? = null
+
   internal fun getCachedPhotoContextForTest(): CachedSamPhotoEmbedding? = cachedPhotoContext
 
   fun isReady(): Boolean =
     !closed &&
       status == ModelRuntimeStatus.READY &&
-      modelState == SlimSamModelState.READY &&
+      (modelState == SlimSamModelState.READY || modelState == SlimSamModelState.INFERENCE_RUNNING) &&
       encoder.isLoaded() &&
       decoder.isLoaded() &&
       processor != null
@@ -569,6 +577,7 @@ class SlimSamSegmenter(
     }
     val metadata = SamPreprocessedMetadata.from(preprocessed)
     onStage(SlimSamStage.ENCODER)
+    encoderInputObserverForTest?.invoke(preprocessed)
     val embedding = encoder.encode(preprocessed.pixelValues)
     coroutineContext.ensureActive()
     return metadata to embedding
@@ -608,6 +617,11 @@ class SlimSamSegmenter(
       val promptMappingEndNs = SystemClock.elapsedRealtimeNanos().coerceAtLeast(promptMappingStartNs)
 
       onStage(SlimSamStage.DECODER)
+      decoderInputsObserverForTest?.invoke(
+        mappedPrompts.samPointCoords,
+        mappedPrompts.samPointLabels,
+        cachedEmbedding.embedding,
+      )
       val decoderOut = decoder.decode(
         embedding = cachedEmbedding.embedding,
         pointCoords = mappedPrompts.samPointCoords,

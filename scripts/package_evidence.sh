@@ -8,6 +8,7 @@ EVIDENCE_SRC="${EVIDENCE_SRC:-$ROOT_DIR/app/build/evidence/p0_v2_2}"
 JUNIT_SRC="${JUNIT_SRC:-$ROOT_DIR/app/build/test-results/testDebugUnitTest}"
 APK_PATH="${APK_PATH:-$ROOT_DIR/app/build/outputs/apk/debug/app-debug.apk}"
 VERIFY_DIR="${VERIFY_DIR:-$ROOT_DIR/app/build/ci-verify}"
+WEB_REFERENCE_SRC="${WEB_REFERENCE_SRC:-$ROOT_DIR/app/build/ci-web-parity/out}"
 OUT_ZIP="${OUT_ZIP:-$ROOT_DIR/FISH_MASK_ANDROID_P0_V2_2_EVIDENCE.zip}"
 
 VERIFIED_SOURCE_HEAD="${VERIFIED_SOURCE_HEAD:-$(git rev-parse HEAD 2>/dev/null || echo 'UNCOMMITTED_WORKSPACE')}"
@@ -17,10 +18,13 @@ trap 'rm -rf "$STAGING_DIR" "$CHECK_DIR"' EXIT
 
 test -d "$EVIDENCE_SRC" || { echo "Missing evidence directory: $EVIDENCE_SRC" >&2; exit 1; }
 test -d "$JUNIT_SRC" || { echo "Missing JUnit directory: $JUNIT_SRC" >&2; exit 1; }
+test -d "$WEB_REFERENCE_SRC" || { echo "Missing Web parity tensor directory: $WEB_REFERENCE_SRC" >&2; exit 1; }
 test -f "$APK_PATH" || { echo "Missing Debug APK: $APK_PATH" >&2; exit 1; }
 
 # 1. Copy evidence outputs (photos, web_android_parity, lifecycle, manifests)
 cp -R "$EVIDENCE_SRC"/. "$STAGING_DIR"/
+mkdir -p "$STAGING_DIR/web_android_parity/web_reference"
+cp -R "$WEB_REFERENCE_SRC"/. "$STAGING_DIR/web_android_parity/web_reference/"
 
 # Verify all 4 photos and required files exist
 for pid in preset_fish preset_catfish preset_snakehead fish_crop; do
@@ -37,10 +41,64 @@ for pid in preset_fish preset_catfish preset_snakehead fish_crop; do
       exit 1
     }
   done
+  for fname in yolox_input_bgr.f32 yolox_raw_output.f32 sam_pixel_values_android.f32 \
+    sam_image_embeddings_android.f32 sam_positional_embeddings_android.f32 \
+    sam_input_points_android.f32 sam_input_labels_android.i64 sam_pred_masks_android.f32 \
+    sam_iou_scores_android.f32 numerical_divergence.json tensor_manifest.json; do
+    test -s "$STAGING_DIR/photos/$pid/tensors/$fname" || {
+      echo "Missing or empty Android tensor evidence: photos/$pid/tensors/$fname" >&2
+      exit 1
+    }
+  done
 done
 
 test -f "$STAGING_DIR/web_android_parity/summary.json" || { echo "Missing web_android_parity/summary.json" >&2; exit 1; }
 test -f "$STAGING_DIR/web_android_parity/parity_report.md" || { echo "Missing web_android_parity/parity_report.md" >&2; exit 1; }
+test -f "$STAGING_DIR/web_android_parity/gate_status.json" || { echo "Missing web_android_parity/gate_status.json" >&2; exit 1; }
+python3 - "$STAGING_DIR" <<'PYEOF'
+import hashlib, json, os, sys
+
+root = sys.argv[1]
+status_path = os.path.join(root, "web_android_parity", "gate_status.json")
+with open(status_path, encoding="utf-8") as f:
+    status = json.load(f)
+if status.get("status") != "PASS":
+    raise SystemExit(f"Parity gate status is not PASS: {status.get('status')}")
+if status.get("fixturesCaptured") != 4 or status.get("fixturesExpected") != 4:
+    raise SystemExit(f"Parity fixture coverage is incomplete: {status}")
+web = os.path.join(root, "web_android_parity", "web_reference")
+with open(os.path.join(web, "web_results.json"), encoding="utf-8") as f:
+    results = json.load(f)
+expected = {"preset_fish", "preset_catfish", "preset_snakehead", "fish_crop"}
+if set(results) != expected:
+    raise SystemExit(f"Web tensor results do not cover all frozen photos: {sorted(results)}")
+for photo in sorted(expected):
+    tensors = os.path.join(web, photo, "tensors")
+    manifest_path = os.path.join(tensors, "tensor_manifest.json")
+    if not os.path.isfile(manifest_path) or os.path.getsize(manifest_path) == 0:
+        raise SystemExit(f"Missing Web tensor manifest for {photo}")
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    for entry in manifest.get("tensors", []):
+        tensor_path = os.path.join(tensors, entry["file"])
+        if not os.path.isfile(tensor_path) or os.path.getsize(tensor_path) != entry["sizeBytes"]:
+            raise SystemExit(f"Missing/truncated Web tensor: {photo}/{entry['file']}")
+        with open(tensor_path, "rb") as tensor_file:
+            actual_sha = hashlib.sha256(tensor_file.read()).hexdigest()
+        if actual_sha != entry["sha256"]:
+            raise SystemExit(f"Web tensor SHA-256 mismatch: {photo}/{entry['file']}")
+    android_tensors = os.path.join(root, "photos", photo, "tensors")
+    with open(os.path.join(android_tensors, "tensor_manifest.json"), encoding="utf-8") as f:
+        android_manifest = json.load(f)
+    for entry in android_manifest.get("tensors", []):
+        tensor_path = os.path.join(android_tensors, entry["file"])
+        if not os.path.isfile(tensor_path) or os.path.getsize(tensor_path) != entry["sizeBytes"]:
+            raise SystemExit(f"Missing/truncated Android tensor: {photo}/{entry['file']}")
+        with open(tensor_path, "rb") as tensor_file:
+            actual_sha = hashlib.sha256(tensor_file.read()).hexdigest()
+        if actual_sha != entry["sha256"]:
+            raise SystemExit(f"Android tensor SHA-256 mismatch: {photo}/{entry['file']}")
+PYEOF
 test -f "$STAGING_DIR/lifecycle/native_resource_lifecycle.log" || { echo "Missing lifecycle log" >&2; exit 1; }
 test -f "$STAGING_DIR/lifecycle/shutdown_test_results.json" || { echo "Missing shutdown_test_results.json" >&2; exit 1; }
 
@@ -124,7 +182,7 @@ ENC_SHA=$(unzip -p "$APK_PATH" "assets/models/slimsam/onnx/vision_encoder_quanti
 DEC_SHA=$(unzip -p "$APK_PATH" "assets/models/slimsam/onnx/prompt_encoder_mask_decoder_quantized.onnx" | sha256sum | awk '{print $1}')
 
 cat > "$VERIFY_DIR/build-metadata.txt" <<EOF
-task_id=FISH_MASK_ANDROID_P0_V2_2_STARTUP_WARMUP_AND_INFERENCE_OPTIMIZATION
+task_id=FISH_MASK_ANDROID_P0_V2_2_2_FISH_CROP_PARITY_AND_APK_DELIVERY
 application_id=com.yujian.fishmasklab
 verified_source_head=$VERIFIED_SOURCE_HEAD
 archive_commit_note=The evidence archive is generated from the exact tested and built source commit SHA recorded in verified_source_head.

@@ -248,6 +248,10 @@ class NativeLifecycleTest {
       )
       assertTrue(refocusTask > 0L)
       assertTrue("Decoder run must start", decoderEntered.await(15, TimeUnit.SECONDS))
+      assertTrue(
+        "Loaded SlimSAM sessions remain ready while decoder inference is running",
+        segmenter.isReady(),
+      )
 
       val shutdownDeferred = async(Dispatchers.Default) {
         vm.clearForTestAndAwait()
@@ -328,7 +332,11 @@ class NativeLifecycleTest {
             .filterIsInstance<PipelineProgressEvent.StateChanged>()
             .first { it.taskId == lastTapTask && (it.state == PipelineState.PLAYING || it.state == PipelineState.ERROR) }
         }
-        assertEquals(PipelineState.PLAYING, finalEvent.state)
+        assertEquals(
+          "Final rapid refocus failed: ${finalEvent.errorReason} ${finalEvent.diagnosticMessage}",
+          PipelineState.PLAYING,
+          finalEvent.state,
+        )
         assertTrue("Final tap refocus must reuse cached embedding", finalEvent.reusedEncoderEmbedding)
         assertEquals("Decoder calls must never overlap concurrently", 1, maxConcurrentDecodes.get())
       } finally {
