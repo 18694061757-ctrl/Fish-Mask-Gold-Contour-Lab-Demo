@@ -486,6 +486,10 @@ class YoloxFishDetector(
     mapper: ImageCoordinateMapper,
   ): YoloxDetectionOutcome = withContext(Dispatchers.Default) {
     ensureActive()
+    require(sourceBitmap.width == mapper.origWidth && sourceBitmap.height == mapper.origHeight) {
+      "YOLOX source bitmap ${sourceBitmap.width}x${sourceBitmap.height} must match mapper dimensions " +
+        "${mapper.origWidth}x${mapper.origHeight}"
+    }
     if (gate.isClosingOrClosed()) {
       throw CancellationException("YoloxFishDetector is closing or closed")
     }
